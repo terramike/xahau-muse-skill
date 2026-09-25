@@ -3,7 +3,7 @@ name: xahau
 description: Interact with the Xahau network — payments, trustlines, Hooks, xMerch, and the monthly XAH ClaimReward — with a propose → Xaman payload → phone-tap safety boundary. No seed ever touches the skill.
 ---
 
-# xahau-muse-skill (P1)
+# xahau-muse-skill v0.1.0
 
 Interact with the Xahau network from the terminal — payments, trustlines,
 URITokens, and the monthly XAH ClaimReward — with a hard safety boundary
@@ -13,7 +13,7 @@ There is **no local seed and no private key anywhere in this skill**.
 Signing happens in the Xaman wallet on your phone via a sign-request
 payload. That tap is the real approval.
 
-## Architecture: propose → review → payload → phone tap (v0.1)
+## Architecture: propose → review → payload → phone tap (v0.1.0)
 
 Two programs. The agent only ever runs the first.
 
