@@ -14,6 +14,9 @@ import tempfile
 import types
 from decimal import Decimal
 
+os.environ.setdefault("XAHAU_DATA_DIR",
+                       tempfile.mkdtemp(prefix="xahau-test-"))
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
 import xahau_common as C
 

@@ -11,6 +11,9 @@ Test addresses below were freshly generated for these tests and hold no
 funds; they replace no real addresses.
 """
 import importlib.util
+import os
+os.environ.setdefault("XAHAU_DATA_DIR",
+                       __import__("tempfile").mkdtemp(prefix="xahau-test-"))
 import sys
 from decimal import Decimal
 from pathlib import Path

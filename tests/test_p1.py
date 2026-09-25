@@ -11,6 +11,9 @@ Note: xrpl-py 5.2.0's binary codec does NOT know Xahau-only tx types —
 envelopes bind the canonical-JSON digest instead (see xahau_common).
 """
 import importlib.util
+import os
+os.environ.setdefault("XAHAU_DATA_DIR",
+                       __import__("tempfile").mkdtemp(prefix="xahau-test-"))
 import json
 import sys
 import tempfile

@@ -115,13 +115,18 @@ Writing (always propose → human reviews hash → payload → phone tap):
   `[--burnable] [--price "VALUE CCY[.ISSUER]"] [--destination r…]`
 - `uritoken-buy --token-id <64hex> --amount "VALUE CCY[.ISSUER]"`
 - `uritoken-burn --token-id <64hex>`
+- `import --xpop <hex> [--burn-tx <xrpl-hash>]` — Burn2Mint Xahau side
+  (see below; XRPL burn + XPOP capture are manual prerequisites)
 - `xahau-payload resume --hash <prefix>` — re-check an ambiguous payload
   (timeout/interrupt); never re-sends
+- `xahau-payload spend-status` — spend ledger health + pending reservations
+- `xahau-payload reset-spend [--force]` — archive + clear the spend
+  ledger (corrupt ledgers refuse new payloads until reset)
 
-Honest scope: `Payment`, `TrustSet`, `ClaimReward`, `Remit`, and
-`URITokenMint` / `URITokenBuy` / `URITokenBurn` builders are implemented —
-the policy allowlist matches. `Import` (Burn2Mint) and `SetHook` are
-planned and refused by default policy until then.
+Honest scope: `Payment`, `TrustSet`, `ClaimReward`, `Remit`, `Import`,
+and `URITokenMint` / `URITokenBuy` / `URITokenBurn` builders are
+implemented — the policy allowlist matches. `SetHook` is planned and
+refused by default policy until then.
 
 ### xMerch storefronts (`bin/xmerch`)
 
@@ -209,6 +214,32 @@ blocked by a restricted-buyer `Destination`. `uritoken-burn` refuses
 unless you are the token's owner or issuer (issuer burns need
 `tfBurnable` from mint, or the ledger rejects with `tecNO_PERMISSION`).
 
+### Import (Burn2Mint) — Xahau side only
+
+```bash
+xahau import --xpop <hex> [--burn-tx <xrpl-hash>]
+```
+
+The XRPL burn and the XPOP capture are **deliberate manual steps** —
+this command only builds the Xahau-side `Import` from an already-made
+XPOP. It never burns anything and never collects XPOPs.
+
+Honest scope, straight from the protocol docs:
+
+- **ZeroB2M is active on mainnet** — Import mints nothing there. On
+  mainnet it is useful for key synchronization and account activation
+  only. Do not claim the burn→mint headline behavior.
+- The Import must be signed by the **same account** that made the XRPL
+  burn — the builder parses the burn account from the XPOP and refuses
+  client-side if it differs from `--address`.
+- An account that does **not** exist on Xahau yet is **created** by the
+  Import with `Sequence: 0` and `Fee: 0` — the builder fills those
+  automatically when `account_info` reports the account missing.
+- `Destination` is not built (out of scope for v1).
+- XPOPs are large; Xaman payload acceptance of a large `Blob` and
+  public-node Import submission are **unverified** — a clean
+  `tesSUCCESS` through Xaman is still an open question.
+
 ## Setup
 
 ```bash
@@ -224,15 +255,26 @@ expected state until the operator provides a key.
 
 ## The platform boundary (read this)
 
-The phone tap in Xaman is the real human approval — the proposal-hash
-review in chat is the pre-check. Client-side spend limits and the
-destination allowlist are enforced when the payload is *created*; they
-are best-effort, not a vault boundary. `tesSUCCESS` from submission is
+The phone tap in Xaman is the real human approval and the wallet security
+boundary — the proposal-hash review in chat is the pre-check. Be clear
+about who controls what: local policy checks (spend limits, destination
+allowlist, Hook gates) and the proposal hash review are checks the
+*operator* runs on their own machine; they are best-effort, not a vault
+boundary. Only the Xaman phone approval (PIN/biometric tap) can move
+funds — nothing moves without it, ever. Client-side spend limits and the
+destination allowlist are enforced when the payload is *created*. The
+destination Hook gate runs twice: advisory at proposal time and again
+against current ledger state at payload creation, because Hooks can be
+installed between proposal and approval — the phone tap remains the
+final gate. `tesSUCCESS` from submission is
 provisional until the validated ledger confirms it — `xahau-payload`
 waits and reports the validated result, decoding Hook return messages
 on failure and treating `tec*` results as fee-only spend. A timeout or
 interruption never releases an ambiguous reservation; `resume --hash`
-re-checks it. The payload path is tested
+re-checks it. A 409 duplicate from Xaman keeps the reservation and
+reconciles by UUID (`resume --hash … --uuid …`). A corrupt spend ledger
+fails closed: new payloads are refused until it is recovered or
+explicitly reset (`xahau-payload reset-spend`). The payload path is tested
 against the live Xaman API on testnet (propose → payload → phone tap →
 ledger apply confirmed via `tecHOOK_REJECTED` on a Hook-guarded
 destination); a clean `tesSUCCESS` confirmation is still pending.

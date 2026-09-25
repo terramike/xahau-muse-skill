@@ -11,6 +11,9 @@ verified live, not here — the pure comparison helpers they rely on are
 tested below.
 """
 import importlib.util
+import os
+os.environ.setdefault("XAHAU_DATA_DIR",
+                       __import__("tempfile").mkdtemp(prefix="xahau-test-"))
 import sys
 from decimal import Decimal
 from pathlib import Path

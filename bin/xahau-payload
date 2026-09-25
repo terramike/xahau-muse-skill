@@ -49,6 +49,14 @@ def need_keys():
     return key, secret
 
 
+class DuplicatePayloadError(ValueError):
+    """Xaman reports an identical payload already exists (HTTP 409).
+
+    The payload may already be approvable — never release the spend
+    reservation on this path. Reconcile by identifier/UUID instead.
+    """
+
+
 def api_post(path, key, secret, body):
     import requests
     r = requests.post(XAMAN_API + path,
@@ -56,9 +64,8 @@ def api_post(path, key, secret, body):
                                "Content-Type": "application/json"},
                       json=body, timeout=20)
     if r.status_code == 409:
-        raise ValueError("Xaman rejected the payload as a duplicate (409) — "
-                         "a payload with this identifier already exists. "
-                         "Wait for it to resolve or expire, then retry.")
+        raise DuplicatePayloadError(
+            "Xaman reports an identical payload already exists (409).")
     if r.status_code >= 400:
         raise ValueError(f"Xaman API error {r.status_code}: {r.text[:300]}")
     return r.json()
@@ -203,17 +210,32 @@ def cmd_send(args):
         for d in denials:
             print(f"  - {d}")
         sys.exit(1)
+    # 2b. re-check destination Hooks against CURRENT ledger state. The
+    # propose-time gate is advisory — Hooks can be installed or removed
+    # between proposal and phone approval.
+    hook_denials = C.check_destination_hooks_live(rpc_fn, tx, prop)
+    if hook_denials:
+        print("HOOK GATE DENIED — no payload created:")
+        for d in hook_denials:
+            print(f"  - {d}")
+        sys.exit(1)
     # 3. credentials (env only) — checked BEFORE reserving spend, so a
     # keyless run leaves no pending reservation behind
     key, secret = need_keys()
-    # 4. atomic spend reservation
+    # 4. atomic spend reservation (fail closed on corrupt ledger)
     tracker = C.SpentTracker()
-    tracker.sweep_pending(rpc_fn)
+    try:
+        tracker.sweep_pending(rpc_fn)
+    except C.CorruptStateError as e:
+        sys.exit(f"SPEND LEDGER UNHEALTHY — no payload created:\n  {e}")
     if tracker.pending_for_proposal(h):
         sys.exit("This proposal already has a pending payload. Run "
                  f"`xahau-payload resume --hash {h[:16]}`.")
     spends = C.tx_spends(tx)
-    denials, rid = tracker.try_reserve(spends, policy)
+    try:
+        denials, rid = tracker.try_reserve(spends, policy)
+    except C.CorruptStateError as e:
+        sys.exit(f"SPEND LEDGER UNHEALTHY — no payload created:\n  {e}")
     if denials:
         print("SPEND LIMIT DENIED — no payload created:")
         for d in denials:
@@ -234,6 +256,20 @@ def cmd_send(args):
     }
     try:
         created = api_post("", key, secret, body)
+    except DuplicatePayloadError as e:
+        # 409: an identical payload may already exist and be approvable —
+        # releasing the reservation here could free spend for a live
+        # payload. Keep it reserved and reconcile by UUID.
+        C.audit("payload-send", h, None, lock, tx["Account"],
+                "payload-duplicate-409", note=f"identifier={identifier}",
+                spends=spends)
+        sys.exit(
+            f"{e} Spend remains RESERVED.\n"
+            f"  1. Find the existing payload in the Xaman developer\n"
+            f"     dashboard (identifier: {identifier}).\n"
+            f"  2. Bind it and continue: xahau-payload resume --hash\n"
+            f"     {h[:16]} --uuid <payload-uuid>.\n"
+            f"  3. Or wait for it to expire/reject, then retry this command.")
     except ValueError as e:
         tracker.release_reservation(rid)
         sys.exit(f"payload was refused ({e}); reservation released")
@@ -270,7 +306,12 @@ def cmd_send(args):
 
 
 def cmd_resume(args):
-    """Re-check a payload whose outcome is unknown (timeout/interrupt)."""
+    """Re-check a payload whose outcome is unknown (timeout/interrupt).
+
+    With --uuid, bind an existing Xaman payload (e.g. found in the
+    dashboard after a 409 duplicate response) to the pending reservation
+    before continuing.
+    """
     prop, path = C.load_proposal(args.hash)
     try:
         tx = C.verify_proposal(prop, path)
@@ -281,13 +322,60 @@ def cmd_resume(args):
     if not pending:
         sys.exit("No pending reservation for this proposal.")
     entry = pending[0]
-    uuid = entry.get("payload_uuid")
+    if args.uuid:
+        tracker.bind_payload(entry["rid"], prop["proposal_hash"], args.uuid)
+        uuid = args.uuid
+        print(f"Bound existing payload {uuid} to the pending reservation.")
+    else:
+        uuid = entry.get("payload_uuid")
     if not uuid:
         sys.exit("Pending reservation has no payload UUID. Check the Xaman "
                  "dashboard and audit log before taking further action.")
     key, secret = need_keys()
     finish_payload(prop, tx, uuid, tracker, entry["rid"], key, secret,
                    prop["network"], args.wait_seconds)
+
+
+def cmd_reset_spend(args):
+    """Archive the spend ledger and start fresh.
+
+    Allowed when the ledger is corrupt (the recovery path) or with
+    --force. The old file is archived, never deleted.
+    """
+    tracker = C.SpentTracker()
+    try:
+        prev = tracker.reset_ledger(force=args.force)
+    except C.CorruptStateError as e:
+        sys.exit(str(e))
+    print(f"Previous ledger state was '{prev}'; archived and reset to empty.")
+    print("Rolling spend totals are now zero — re-verify recent activity")
+    print("before creating new payloads.")
+
+
+def cmd_spend_status(args):
+    tracker = C.SpentTracker()
+    h = tracker.health()
+    print(f"ledger: {h} ({C.STATE_PATH})")
+    if h == "corrupt":
+        print("New payloads are refused until recovery. Options:")
+        print("  - restore the file from backup, or")
+        print("  - run: xahau-payload reset-spend")
+        return
+    entries = tracker._load()["entries"]
+    now = int(time.time())
+    live = [e for e in entries
+            if e.get("status") == "pending"
+            or now - int(e.get("ts", 0)) < C.ROLLING_WINDOW]
+    totals = {}
+    for e in live:
+        totals[e["asset"]] = totals.get(e["asset"], C.Decimal(0)) + \
+            C.Decimal(e["amount"])
+    print(f"entries in rolling window: {len(live)}")
+    for asset, amt in sorted(totals.items()):
+        print(f"  {asset}: {amt}")
+    pend = [e for e in live if e.get("status") == "pending"]
+    if pend:
+        print(f"pending reservations: {len(pend)}")
 
 
 def main():
@@ -306,8 +394,17 @@ def main():
     s = sub.add_parser("resume")
     s.add_argument("--hash", required=True,
                    help="proposal hash prefix (pending payload)")
+    s.add_argument("--uuid",
+                   help="bind an existing Xaman payload UUID (e.g. after a "
+                        "409 duplicate response) before resuming")
     s.add_argument("--wait-seconds", type=int, default=60,
                    help="how long to wait for resolution before giving up")
+    s = sub.add_parser("reset-spend")
+    s.add_argument("--force",
+                   help="reset even a healthy ledger (archives it first)",
+                   action="store_true")
+    s = sub.add_parser("spend-status",
+                       help="show spend-ledger health and rolling totals")
     args = ap.parse_args()
     if args.list or args.cmd == "list":
         cmd_list(args)
@@ -315,6 +412,10 @@ def main():
         cmd_send(args)
     elif args.cmd == "resume":
         cmd_resume(args)
+    elif args.cmd == "reset-spend":
+        cmd_reset_spend(args)
+    elif args.cmd == "spend-status":
+        cmd_spend_status(args)
     else:
         ap.print_help()
         sys.exit(2)

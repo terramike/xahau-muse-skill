@@ -238,19 +238,31 @@ def ripple_time_from_now(seconds: int) -> int:
     return int(time.time()) - RIPPLE_EPOCH + seconds
 
 
-def save_proposal(tx_dict, network, account, action):
-    """Build a hash-bound proposal envelope and save it. Returns (hash, path)."""
+def save_proposal(tx_dict, network, account, action, allow_hooks=False,
+                 meta=None):
+    """Build a hash-bound proposal envelope and save it. Returns (hash, path).
+
+    allow_hooks records the operator's attestation that destination Hooks
+    were acknowledged at propose time. meta holds non-critical provenance
+    (e.g. the XRPL burn tx behind an Import). Both are deliberately
+    OUTSIDE the hashed core: the payload step re-checks Hooks live anyway,
+    and old envelopes (without the keys) verify as allow_hooks=False —
+    fail closed.
+    """
     PROPOSALS_DIR.mkdir(parents=True, exist_ok=True)
     envelope = {
         "format": ENVELOPE_FORMAT,
         "network": network,
         "account": account,
         "action": action,
+        "allow_hooks": bool(allow_hooks),
         "created_at": int(time.time()),
         "policy_version": POLICY_VERSION,
         "tx": tx_dict,
         "tx_sha256": tx_sha256(tx_dict),
     }
+    if meta:
+        envelope["meta"] = dict(meta)
     core = {k: envelope[k] for k in ENVELOPE_HASH_KEYS}
     h = hashlib.sha256(json.dumps(
         core, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -311,7 +323,7 @@ def verify_envelope_invariants(prop: dict, tx: dict, network_id: int):
         "OfferCreate": ("buy", "sell"),
         "OfferCancel": ("cancel",),
         "TrustSet": ("trustline",),
-        "URITokenMint": ("mint",),
+        "URITokenMint": ("uritoken-mint",),
         "URITokenBuy": ("uritoken-buy",),
         "URITokenBurn": ("uritoken-burn",),
         "SetHook": ("sethook",),
@@ -362,6 +374,43 @@ def fmt_amount(a) -> str:
 
 def short_addr(a: str) -> str:
     return a if len(a) <= 16 else f"{a[:8]}…{a[-4:]}"
+
+
+BURN_TX_TYPES = ("AccountSet", "SetRegularKey", "SignerListSet")
+XPOP_MAX_BYTES = 1_000_000  # sanity cap: real XPOPs are a few KB
+
+
+def xpop_burn_account(blob_hex):
+    """Best-effort: extract the burn transaction's Account from an XPOP.
+
+    The Import Blob is a hex-encoded JSON document containing the XRPL
+    burn transaction. We iteratively search for a burn-type transaction
+    and return its Account. Returns None when the structure is
+    unrecognized — callers must treat None as 'unverifiable', never as
+    'matches'. The ledger itself enforces the same-account rule.
+    """
+    try:
+        raw = bytes.fromhex(blob_hex)
+    except (ValueError, TypeError):
+        return None
+    if len(raw) > XPOP_MAX_BYTES or not raw:
+        return None
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    stack = [doc]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            if (node.get("TransactionType") in BURN_TX_TYPES
+                    and isinstance(node.get("Account"), str)
+                    and is_valid_classic_address(node["Account"])):
+                return node["Account"]
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return None
 
 
 def describe_tx(tx: dict, action_hint: str = "?") -> list:
@@ -423,7 +472,18 @@ def describe_tx(tx: dict, action_hint: str = "?") -> list:
         if tx.get("MintURIToken"):
             lines += ["mint:     URIToken mint attached"]
     elif ttype == "Import":
-        lines += [f"issuer:   {short_addr(tx.get('Issuer', ''))}"]
+        blob = tx.get("Blob", "")
+        lines += [f"xpop:     {len(blob) // 2} bytes of burn proof"]
+        burn_acct = xpop_burn_account(blob)
+        if burn_acct:
+            lines += [f"burn acct: {short_addr(burn_acct)}"]
+            if burn_acct != tx.get("Account"):
+                lines += ["WARNING:  burn account != Import account — the "
+                          "ledger will reject this"]
+        else:
+            lines += ["burn acct: (not parsed — ledger enforces same-account)"]
+        if tx.get("Fee") == "0":
+            lines += ["mode:     NEW ACCOUNT — created by this Import"]
     elif ttype == "SetHook":
         lines += ["effect:   install/update on-ledger Hook code",
                   "(review hook code out-of-band — the skill cannot "
@@ -455,7 +515,7 @@ REQUIRED_FIELDS = {
     "SetHook": {"CreateCode"},
     "Remit": {"Destination", "Amounts"},
     "ClaimReward": set(),
-    "Import": {"Issuer"},
+    "Import": {"Blob"},
 }
 # Conservative per-type field schemas. A tx cannot smuggle fields outside
 # its type's schema (no Paths/SendMax/Memos/partial-payment flags, etc.).
@@ -485,7 +545,8 @@ ALLOWED_FIELDS = {
 # TickSize. The skill's allowlist MUST NOT include the disabled types.
 # Enable only types with implemented builders and complete spend accounting.
 DEFAULT_ALLOWED_TX_TYPES = ["Payment", "TrustSet", "ClaimReward", "Remit",
-                            "URITokenMint", "URITokenBuy", "URITokenBurn"]
+                            "URITokenMint", "URITokenBuy", "URITokenBurn",
+                            "Import"]
 
 
 def validate_tx_shape(tx: dict, allowed_types) -> list:
@@ -847,6 +908,15 @@ def _exclusive_lock(f):
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
+class CorruptStateError(Exception):
+    """The spend ledger exists but is unreadable — fail closed.
+
+    Never silently substitute an empty ledger: that would bypass rolling
+    spend limits. New payloads are refused until the operator recovers the
+    file from backup or explicitly resets it (archiving the corrupt copy).
+    """
+
+
 class SpentTracker:
     """True rolling-24h per-asset spend tracker with an exclusive file lock.
 
@@ -882,11 +952,19 @@ class SpentTracker:
     def _load(self):
         try:
             st = json.loads(self.state_path.read_text())
-        except (FileNotFoundError, json.JSONDecodeError):
+        except FileNotFoundError:
             return {"entries": []}
+        except json.JSONDecodeError as e:
+            raise CorruptStateError(
+                f"spend ledger {self.state_path} is corrupt ({e}); refusing "
+                f"to treat it as empty. Recover it from backup or run "
+                f"`xahau-payload reset-spend`.") from e
         if isinstance(st.get("entries"), list):
             return {"entries": st["entries"]}
-        return {"entries": []}
+        raise CorruptStateError(
+            f"spend ledger {self.state_path} has an invalid shape; refusing "
+            f"to treat it as empty. Recover it from backup or run "
+            f"`xahau-payload reset-spend`.")
 
     def _save(self, st):
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -894,6 +972,38 @@ class SpentTracker:
         tmp.write_text(json.dumps(st))
         os.chmod(tmp, 0o600)
         tmp.replace(self.state_path)
+
+    def health(self):
+        """'ok' | 'fresh' | 'corrupt' — for status display and reset gating."""
+        if not self.state_path.exists():
+            return "fresh"
+        try:
+            self._load()
+        except CorruptStateError:
+            return "corrupt"
+        return "ok"
+
+    def reset_ledger(self, force=False):
+        """Archive the current ledger and start fresh.
+
+        Refuses when the ledger is healthy unless force=True — resetting a
+        good ledger would understate rolling spend. The old file is always
+        archived, never deleted.
+        """
+        with self._locked():
+            h = self.health()
+            if h == "ok" and not force:
+                raise CorruptStateError(
+                    "spend ledger is healthy — refusing to reset without "
+                    "--force (resetting a good ledger understates rolling "
+                    "spend).")
+            if self.state_path.exists():
+                bak = self.state_path.with_name(
+                    f"state.corrupt.{int(time.time())}.bak")
+                os.chmod(self.state_path, 0o600)
+                self.state_path.replace(bak)
+            self._save({"entries": []})
+            return h
 
     @staticmethod
     def _prune(entries, now):
@@ -990,21 +1100,31 @@ class SpentTracker:
                     if e.get("proposal_hash") == proposal_hash
                     and e.get("status") == "pending"]
 
+    @staticmethod
+    def _apply_validated_failure(entries, tx_hash, fee_drops):
+        """Fee-only accounting for a validated failure.
+
+        Shared by fail_tx (normal path) and sweep_pending (recovery path)
+        so both agree: native entries keep the fee and are marked
+        confirmed; IOU entries delivered nothing and are dropped.
+        """
+        out = []
+        for e in entries:
+            if e.get("tx_hash") == tx_hash and e.get("status") == "pending":
+                if e.get("asset") != NATIVE:
+                    continue  # a validated failure moves no IOUs
+                e["amount"] = str(drops_to_xah(fee_drops))
+                e["status"] = "confirmed"
+            out.append(e)
+        return out
+
     def fail_tx(self, tx_hash, fee_drops):
         """Validated failure consumes only the fee, not the proposed amount."""
         with self._locked():
             st = self._load()
-            keep = []
-            for e in st["entries"]:
-                if e.get("tx_hash") == tx_hash and e.get("status") == "pending":
-                    if e.get("asset") != NATIVE:
-                        continue
-                    # Native payments include amount + fee in one reservation.
-                    # Keep the fee only after a validated failure.
-                    e["amount"] = str(drops_to_xah(fee_drops))
-                    e["status"] = "confirmed"
-                keep.append(e)
-            self._save({"entries": keep})
+            st["entries"] = self._apply_validated_failure(
+                st["entries"], tx_hash, fee_drops)
+            self._save(st)
 
     def confirm(self, tx_hash):
         with self._locked():
@@ -1024,9 +1144,13 @@ class SpentTracker:
     def sweep_pending(self, rpc_fn):
         """Resolve ambiguous pending reservations against the ledger.
 
-        For each bound pending entry whose LastLedgerSequence has passed the
-        validated ledger: tesSUCCESS -> confirmed; validated failure or
-        provably not included -> released. Uncertain stays pending.
+        For each bound pending entry whose LastLedgerSequence has passed
+        the validated ledger, applies the SAME verified-outcome accounting
+        as the normal payload path: tesSUCCESS -> confirmed in full;
+        validated tec failure -> fee-only via _apply_validated_failure
+        (the exact helper fail_tx uses); provably never included
+        (txnNotFound past LastLedgerSequence) -> released. Anything
+        uncertain stays pending — a reservation never silently vanishes.
         """
         with self._locked():
             now = int(time.time())
@@ -1040,32 +1164,38 @@ class SpentTracker:
             try:
                 cur = rpc_fn("ledger", [{"ledger_index": "validated"}]
                              ).get("ledger_index")
+                cur = int(cur)
             except Exception:  # noqa: BLE001
                 self._save({"entries": entries})
                 return  # cannot tell — keep everything pending
-            keep = []
-            for e in entries:
-                if (e.get("status") == "pending" and e.get("tx_hash")
-                        and e.get("last_ledger")
-                        and int(e["last_ledger"]) < int(cur)):
+            expired = {e["tx_hash"] for e in bound
+                       if int(e["last_ledger"]) < cur}
+            for txh in expired:
+                try:
+                    r = rpc_fn("tx", [{"transaction": txh}])
+                except Exception as exc:  # noqa: BLE001
+                    if "txnNotFound" in str(exc):
+                        # Past its last ledger and nowhere on ledger: it
+                        # can never be included. Release the reservation.
+                        entries = [e for e in entries
+                                   if e.get("tx_hash") != txh]
+                    continue  # transient error — keep pending
+                res = (r.get("meta", {}) or {}).get("TransactionResult")
+                if not r.get("validated", False):
+                    continue  # not validated yet — keep pending
+                if res == "tesSUCCESS":
+                    for e in entries:
+                        if (e.get("tx_hash") == txh
+                                and e.get("status") == "pending"):
+                            e["status"] = "confirmed"
+                elif res and res.startswith("tec"):
                     try:
-                        r = rpc_fn("tx", [{"transaction": e["tx_hash"]}])
-                        res = (r.get("meta", {}) or {}
-                               ).get("TransactionResult")
-                        validated = r.get("validated", False)
+                        entries = self._apply_validated_failure(
+                            entries, txh, r.get("Fee"))
                     except Exception:  # noqa: BLE001
-                        keep.append(e)  # uncertain — keep pending
-                        continue
-                    if validated and res == "tesSUCCESS":
-                        e["status"] = "confirmed"
-                        keep.append(e)
-                    elif validated:
-                        pass  # validated failure or not found -> release
-                    else:
-                        keep.append(e)
-                else:
-                    keep.append(e)
-            self._save({"entries": keep})
+                        continue  # cannot account the fee — keep pending
+                # Any other validated result: keep pending (fail closed).
+            self._save({"entries": entries})
 
 
 def audit(action, proposal_hash, tx_hash, network, account, result, note="",
@@ -1103,6 +1233,35 @@ def _hook_count(rpc_fn, address) -> int:
             return 0
         raise
     return len(res.get("account_objects", []))
+
+
+def check_destination_hooks_live(rpc_fn, tx, prop):
+    """Re-check destination Hooks at payload-creation time.
+
+    The propose-time gate is advisory: Hooks can be installed (or removed)
+    between proposal and phone approval. This runs right before the Xaman
+    payload is created so the refusal reflects current ledger state.
+    Returns a list of denial reasons (empty = pass).
+    """
+    if tx.get("TransactionType") not in ("Payment", "Remit"):
+        return []
+    dest = tx.get("Destination")
+    if not dest:
+        return []
+    try:
+        hooks = _hook_count(rpc_fn, dest)
+    except Exception as e:  # noqa: BLE001
+        return [f"destination Hook state unreadable ({e}) — fail closed"]
+    if not hooks:
+        return []
+    if prop.get("allow_hooks"):
+        print(f"NOTE: destination still has {hooks} Hook(s) installed — "
+              f"acknowledged at proposal time. Hooks may have changed since; "
+              f"the Xaman phone approval is the final gate.")
+        return []
+    return [f"destination {dest} has {hooks} Hook(s) installed — changed or "
+            f"unacknowledged since proposal. Refusing payload creation; "
+            f"re-propose with --allow-hooks if you understand the Hook."]
 
 
 def destination_hook_count(network, address) -> int:

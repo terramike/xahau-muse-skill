@@ -269,6 +269,33 @@ def build_claim(account, issuer=None):
     return tx
 
 
+def build_import(account, xpop_hex):
+    """Import: submit a hex-encoded XPOP (proof of an XRPL burn) to Xahau.
+
+    Returns (tx, burn_account|None). Refuses when the XPOP parses and its
+    burn account provably differs from the Import account — the Import
+    must be signed by the same account that burned. A None burn_account
+    means 'unverifiable client-side'; the ledger enforces the
+    same-account rule.
+    """
+    h = (xpop_hex or "").strip()
+    if (not h or len(h) % 2
+            or any(c not in "0123456789abcdefABCDEF" for c in h)):
+        sys.exit("Bad --xpop: must be hex (the hex-encoded XPOP document)")
+    if len(h) // 2 > C.XPOP_MAX_BYTES:
+        sys.exit(f"--xpop is {len(h) // 2} bytes — exceeds the sanity cap "
+                 f"({C.XPOP_MAX_BYTES}); it would also exceed Xaman payload "
+                 f"limits")
+    blob = h.upper()
+    burn_account = C.xpop_burn_account(blob)
+    if burn_account and burn_account != account:
+        sys.exit(f"XPOP burn account {burn_account} != Import account "
+                 f"{account} — the Import must be signed by the same "
+                 f"account that burned. Refusing.")
+    return ({"Account": account, "TransactionType": "Import", "Blob": blob},
+            burn_account)
+
+
 def autofill(tx, network):
     """Fill Fee / Sequence / LastLedgerSequence / NetworkID from live RPC."""
     info = C.rpc(network, "account_info",
@@ -330,8 +357,9 @@ def autofill(tx, network):
 
 # ---------- ceremony ----------
 
-def propose(tx, action, summary_lines):
-    filled = autofill(tx, CFG["network"])
+def propose(tx, action, summary_lines, allow_hooks=False, prefilled=False,
+            meta=None):
+    filled = tx if prefilled else autofill(tx, CFG["network"])
     lines = [
         f"network:  {CFG['network']} (NetworkID {filled['NetworkID']})",
         f"account:  {filled['Account']}",
@@ -345,7 +373,8 @@ def propose(tx, action, summary_lines):
         exp = time.strftime("%Y-%m-%dT%H:%M:%SZ",
                             time.gmtime(filled["Expiration"] + C.RIPPLE_EPOCH))
         lines.append(f"expires:  {exp}")
-    h, path = C.save_proposal(filled, CFG["network"], filled["Account"], action)
+    h, path = C.save_proposal(filled, CFG["network"], filled["Account"],
+                              action, allow_hooks=allow_hooks, meta=meta)
     print("=" * 60)
     print("PROPOSAL — review carefully. Nothing has been submitted.")
     print("=" * 60)
@@ -543,7 +572,8 @@ def cmd_send(args):
              + (f".{C.short_addr(args.issuer)}" if args.issuer else ""),
              f"to:       {C.short_addr(args.to)}",
              f"dest tag: {args.destination_tag or 'NONE'}",
-             *extra])
+             *extra],
+            allow_hooks=args.allow_hooks)
 
 
 def cmd_remit(args):
@@ -568,7 +598,7 @@ def cmd_remit(args):
     lines += [f"to:       {C.short_addr(args.to)}",
               f"dest tag: {args.destination_tag or 'NONE'}",
               *extra]
-    propose(tx, "remit", lines)
+    propose(tx, "remit", lines, allow_hooks=args.allow_hooks)
 
 
 def cmd_trustline(args):
@@ -586,6 +616,56 @@ def cmd_claim(args):
     acct = need_account(args)
     tx = build_claim(acct, args.issuer)
     propose(tx, "claim", ["effect:   claim monthly XAH balance reward"])
+
+
+def cmd_import(args):
+    """Propose an Import (Burn2Mint) transaction from a hex-encoded XPOP.
+
+    The XRPL burn and the XPOP capture are deliberate MANUAL steps (see
+    SKILL.md) — this command only builds the Xahau side. Per the Import
+    spec, an account that does not exist on Xahau yet is CREATED by the
+    Import with Sequence 0 and Fee 0.
+    """
+    acct = need_account(args)
+    tx, burn_account = build_import(acct, args.xpop)
+    try:
+        info = C.rpc(CFG["network"], "account_info",
+                     [{"account": acct, "ledger_index": "validated"}])
+        exists = bool(info.get("account_data"))
+    except RuntimeError as e:
+        if "actNotFound" in str(e):
+            exists = False
+        else:
+            sys.exit(f"account_info failed: {e}")
+    meta = {}
+    if args.burn_tx:
+        meta["xrpl_burn_tx"] = args.burn_tx.strip()
+    lines = [f"xpop:      {len(tx['Blob']) // 2} bytes of burn proof"]
+    if burn_account:
+        lines.append(f"burn acct: {C.short_addr(burn_account)} "
+                     f"(matches Import account)")
+    else:
+        lines.append("burn acct: (not parsed from XPOP — the ledger "
+                     "enforces the same-account rule)")
+    if args.burn_tx:
+        lines.append(f"burn tx:   {args.burn_tx.strip()[:24]}… "
+                     f"(XRPL, recorded for reconciliation)")
+    if CFG["network"] == "xahau-mainnet":
+        lines.append("NOTE:      ZeroB2M is active on mainnet — this Import "
+                     "mints nothing; it activates the account / syncs keys")
+    if not exists:
+        cur = C.rpc(CFG["network"], "ledger", [{"ledger_index": "current"}])
+        cur_idx = cur.get("ledger_index") or cur.get("ledger_current_index")
+        tx["Sequence"] = 0
+        tx["Fee"] = "0"
+        tx["LastLedgerSequence"] = int(cur_idx) + 20
+        tx["NetworkID"] = C.NETWORK_IDS[CFG["network"]]
+        lines.append("mode:      NEW ACCOUNT — created by this Import, fee 0")
+        propose(tx, "import", lines, prefilled=True,
+                meta=meta or None)
+    else:
+        lines.append("mode:      existing account — key sync / import")
+        propose(tx, "import", lines, meta=meta or None)
 
 
 def cmd_setup(args):
@@ -664,6 +744,14 @@ def main():
     s.add_argument("--address")
     s = sub.add_parser("uritoken-burn")
     s.add_argument("--token-id", required=True); s.add_argument("--address")
+    s = sub.add_parser("import",
+                       help="propose an Import from a hex-encoded XPOP "
+                            "(Burn2Mint, Xahau side only)")
+    s.add_argument("--xpop", required=True,
+                   help="hex-encoded XPOP burn proof")
+    s.add_argument("--burn-tx",
+                   help="XRPL burn tx hash, recorded for reconciliation")
+    s.add_argument("--address")
 
     args = ap.parse_args()
     global CFG
@@ -674,7 +762,8 @@ def main():
      "send": cmd_send, "trustline": cmd_trustline, "remit": cmd_remit,
      "claim": cmd_claim, "uritoken-mint": cmd_uritoken_mint,
      "uritoken-buy": cmd_uritoken_buy,
-     "uritoken-burn": cmd_uritoken_burn}[args.cmd](args)
+     "uritoken-burn": cmd_uritoken_burn,
+     "import": cmd_import}[args.cmd](args)
 
 
 CFG = {}
