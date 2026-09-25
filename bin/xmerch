@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""Read public xMerch listings and hand shoppers to the official checkout."""
+import argparse
+import html
+import re
+import sys
+from urllib.parse import urlparse
+
+SHOP = "https://terramike.xmerch.app"
+
+
+def shop_url(value):
+    parsed = urlparse(value.rstrip("/"))
+    if (parsed.scheme != "https" or not parsed.hostname
+            or not parsed.hostname.endswith(".xmerch.app")
+            or parsed.path not in ("", "/") or parsed.query or parsed.fragment):
+        raise ValueError("shop must be an HTTPS xmerch.app subdomain")
+    return value.rstrip("/")
+
+
+def listings(markup):
+    """Extract product links and visible labels from a public storefront."""
+    found = {}
+    for slug, body in re.findall(
+            r'<a\b[^>]*href="/product/([a-zA-Z0-9_-]+)"[^>]*>(.*?)</a>',
+            markup, re.I | re.S):
+        text = html.unescape(re.sub(r"<[^>]+>", " ", body))
+        text = " ".join(text.split())
+        if slug not in found:
+            found[slug] = text
+    return found
+
+
+def fetch_shop(url):
+    import requests
+    response = requests.get(url, timeout=20)
+    response.raise_for_status()
+    return listings(response.text)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="xmerch")
+    parser.add_argument("--shop", default=SHOP,
+                        help="public HTTPS xMerch storefront")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("shop", help="show public products and prices")
+    checkout = sub.add_parser("checkout", help="show official product checkout URL")
+    checkout.add_argument("--product", required=True, help="product slug")
+    args = parser.parse_args()
+    try:
+        url = shop_url(args.shop)
+        items = fetch_shop(url)
+    except Exception as exc:  # noqa: BLE001
+        sys.exit(f"Could not read public shop: {exc}")
+    if args.command == "shop":
+        print(url)
+        if not items:
+            print("No public product links found; browse the shop directly.")
+        for slug, label in items.items():
+            print(f"- {label or slug}\n  {url}/product/{slug}")
+    elif args.product not in items:
+        sys.exit("Product is not in the current public shop listing.")
+    else:
+        print(f"Open the official xMerch product page: {url}/product/{args.product}")
+        print("Select options, review the live checkout total, and approve "
+              "the Xaman request in the xMerch checkout.")
+        print("A direct wallet payment outside checkout does not create an order.")
+
+
+if __name__ == "__main__":
+    main()

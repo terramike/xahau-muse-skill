@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""xahau-payload v0.1: the PAYLOAD MANAGER for the Xahau Muse skill.
+
+Takes a human-approved proposal hash and turns it into a Xaman
+sign-request payload. The human reviews the proposal hash, then approves
+the tap ON THEIR PHONE in the Xaman app — that tap is the real approval.
+This program never sees a seed or a private key.
+
+Flow:  verify envelope -> policy gates -> reserve spend -> POST
+https://xumm.app/api/v1/platform/payload -> print the sign URL (open it on
+your phone; Xaman pushes if you have interacted with the app before) ->
+poll until resolved/rejected/expired -> verify the validated ledger result
+via public RPC -> audit log.
+
+If the outcome is ambiguous (timeout, crash, no txid), the spend
+reservation is NOT released; `xahau-payload resume --hash <prefix>`
+re-checks the payload later. Only an explicit reject/expire releases.
+
+API credentials come ONLY from the environment (XAMAN_API_KEY /
+XAMAN_API_SECRET) — never from a file, never from chat. Without them the
+payload path refuses to run; that is the expected state until the operator
+provides a key.
+"""
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import xahau_common as C
+
+XAMAN_API = "https://xumm.app/api/v1/platform/payload"
+POLL_INTERVAL = 4
+
+
+def need_keys():
+    # strip(): pasted secrets commonly carry a trailing newline, which is
+    # an illegal HTTP header value and would fail at request time.
+    key = (os.environ.get("XAMAN_API_KEY") or "").strip()
+    secret = (os.environ.get("XAMAN_API_SECRET") or "").strip()
+    if not key or not secret:
+        sys.exit(
+            "XAMAN_API_KEY / XAMAN_API_SECRET are not set.\n"
+            "The payload path is blocked until the operator provides a Xaman\n"
+            "app key+secret (register a free app at the Xaman dev console,\n"
+            "then export them in the shell — never store them in a file).")
+    return key, secret
+
+
+def api_post(path, key, secret, body):
+    import requests
+    r = requests.post(XAMAN_API + path,
+                      headers={"X-API-Key": key, "X-API-Secret": secret,
+                               "Content-Type": "application/json"},
+                      json=body, timeout=20)
+    if r.status_code == 409:
+        raise ValueError("Xaman rejected the payload as a duplicate (409) — "
+                         "a payload with this identifier already exists. "
+                         "Wait for it to resolve or expire, then retry.")
+    if r.status_code >= 400:
+        raise ValueError(f"Xaman API error {r.status_code}: {r.text[:300]}")
+    return r.json()
+
+
+def api_get(uuid, key, secret):
+    import requests
+    r = requests.get(f"{XAMAN_API}/{uuid}",
+                     headers={"X-API-Key": key, "X-API-Secret": secret},
+                     timeout=20)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Xaman API error {r.status_code}: {r.text[:200]}")
+    return r.json()
+
+
+def cmd_list(args):
+    if not C.PROPOSALS_DIR.exists():
+        print("no proposals yet")
+        return
+    for p in sorted(C.PROPOSALS_DIR.glob("*.json"),
+                    key=lambda x: x.stat().st_mtime, reverse=True):
+        try:
+            e = json.loads(p.read_text())
+            age = int(time.time()) - int(e.get("created_at", 0))
+            print(f"{e.get('proposal_hash','?')[:16]}  "
+                  f"{e.get('action','?'):12s} {e.get('network','?'):14s} "
+                  f"{age // 60}m old")
+        except Exception:  # noqa: BLE001
+            print(f"{p.stem[:16]}  (unreadable)")
+
+
+def finish_payload(prop, tx, uuid, tracker, rid, key, secret, lock,
+                   wait_seconds):
+    """Resolve a known Xaman payload without releasing ambiguous spend.
+
+    The reservation is released only when we KNOW nothing was signed
+    (rejected/expired). Any outcome we cannot verify — timeout, missing
+    txid, unvalidated ledger — keeps the spend reserved and tells the
+    operator how to resume.
+    """
+    h = prop["proposal_hash"]
+    rpc_fn = lambda m, p=None: C.rpc(lock, m, p)  # noqa: E731
+    spends = C.tx_spends(tx)
+    deadline = time.time() + wait_seconds
+    st = None
+    while True:
+        try:
+            st = api_get(uuid, key, secret)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  (payload status unavailable: {exc})")
+        if st and (st.get("meta") or {}).get("resolved"):
+            break
+        if time.time() >= deadline:
+            C.audit("payload-send", h, None, lock, tx["Account"],
+                    "pending-payload", note=f"uuid={uuid}", spends=spends)
+            print(f"Payload outcome is unknown; spend stays reserved. "
+                  f"Resume with: xahau-payload resume --hash {h[:16]}")
+            return
+        time.sleep(POLL_INTERVAL)
+
+    meta, response = st.get("meta") or {}, st.get("response") or {}
+    if not meta.get("signed"):
+        tracker.release_reservation(rid)
+        reason = "expired" if meta.get("expired") else "rejected"
+        C.audit("payload-send", h, None, lock, tx["Account"], reason,
+                note=f"uuid={uuid}", spends=spends)
+        print(f"Payload {reason}; no transaction was signed.")
+        return
+
+    txid = response.get("txid")
+    if not txid:
+        C.audit("payload-send", h, None, lock, tx["Account"],
+                "signed-no-txid", note=f"uuid={uuid}", spends=spends)
+        print(f"Xaman reports signed but has no transaction hash yet. "
+              f"Spend stays reserved. Resume with: "
+              f"xahau-payload resume --hash {h[:16]}")
+        return
+    tracker.bind_reservation(rid, txid, tx.get("LastLedgerSequence"))
+    state, result, problems = "pending", None, []
+    ledger_tx = None
+    for _ in range(15):
+        try:
+            ledger_tx = rpc_fn("tx", [{"transaction": txid}])
+            state, result, problems = C.validated_outcome(tx, ledger_tx)
+            if state != "pending":
+                break
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(POLL_INTERVAL)
+
+    if state == "success":
+        tracker.confirm(txid)
+        audit_result = "validated-tesSUCCESS"
+        print(f"VALIDATED SUCCESS: {txid}")
+    elif state == "failed":
+        tracker.fail_tx(txid, tx["Fee"])
+        audit_result = f"validated-{result}"
+        print(f"VALIDATED FAILURE: {result} — only the fee was charged. "
+              f"Transaction: {txid}")
+        for account, message in C.hook_messages(ledger_tx):
+            print(f"  Hook {account}: {message}")
+    elif state == "mismatch":
+        audit_result = "validated-mismatch"
+        print(f"VALIDATED TRANSACTION MISMATCH: {txid}")
+        for problem in problems:
+            print(f"  {problem}")
+        print("Spend stays reserved for manual investigation.")
+    else:
+        audit_result = "pending-ledger"
+        print(f"Signed in Xaman: {txid}. Ledger outcome is still unknown. "
+              "Spend stays reserved; run resume later.")
+    C.audit("payload-send", h, txid, lock, tx["Account"], audit_result,
+            note=f"uuid={uuid}", spends=spends)
+
+
+def cmd_send(args):
+    prop, path = C.load_proposal(args.hash)
+    h = prop.get("proposal_hash")
+    # 1. envelope verification — the tx is the only source of truth
+    try:
+        tx = C.verify_proposal(prop, path)
+    except C.ProposalError as e:
+        sys.exit(f"proposal verification FAILED: {e}")
+    policy = C.load_policy()
+    lock = policy.get("network_lock", "xahau-testnet")
+    try:
+        C.verify_envelope_invariants(prop, tx, C.NETWORK_IDS[lock])
+    except C.ProposalError as e:
+        sys.exit(f"envelope invariant FAILED: {e}")
+    # 2. policy gates for payload CREATION
+    C.check_protected_files()
+    denials = C.policy_check(prop, tx, policy)
+    if denials:
+        print("POLICY DENIED — no payload created:")
+        for d in denials:
+            print(f"  - {d}")
+        sys.exit(1)
+    rpc_fn = lambda m, p=None: C.rpc(lock, m, p)  # noqa: E731
+    denials = C.check_require_dest_tag(rpc_fn, tx)
+    if denials:
+        print("POLICY DENIED — no payload created:")
+        for d in denials:
+            print(f"  - {d}")
+        sys.exit(1)
+    # 3. credentials (env only) — checked BEFORE reserving spend, so a
+    # keyless run leaves no pending reservation behind
+    key, secret = need_keys()
+    # 4. atomic spend reservation
+    tracker = C.SpentTracker()
+    tracker.sweep_pending(rpc_fn)
+    if tracker.pending_for_proposal(h):
+        sys.exit("This proposal already has a pending payload. Run "
+                 f"`xahau-payload resume --hash {h[:16]}`.")
+    spends = C.tx_spends(tx)
+    denials, rid = tracker.try_reserve(spends, policy)
+    if denials:
+        print("SPEND LIMIT DENIED — no payload created:")
+        for d in denials:
+            print(f"  - {d}")
+        sys.exit(1)
+    # 5. create the payload
+    action = prop.get("action", "?")
+    summary = "; ".join(C.describe_tx(tx, action)[:4])
+    identifier = f"xahau-{h[:12]}-{int(time.time())}"[:40]
+    body = {
+        "txjson": tx,
+        "options": {"submit": True, "expire": args.expire_minutes},
+        "custom_meta": {
+            "identifier": identifier,
+            "instruction": (f"Xahau {action} on {lock}: {summary}. "
+                            f"Review carefully in Xaman before approving.")[:280],
+        },
+    }
+    try:
+        created = api_post("", key, secret, body)
+    except ValueError as e:
+        tracker.release_reservation(rid)
+        sys.exit(f"payload was refused ({e}); reservation released")
+    except Exception as e:  # noqa: BLE001
+        # Outcome unknown — the payload may exist on Xaman's side.
+        C.audit("payload-send", h, None, lock, tx["Account"],
+                "payload-create-unknown", note=f"identifier={identifier}",
+                spends=spends)
+        sys.exit(f"payload creation outcome unknown ({e}); spend remains "
+                 "reserved. Check the Xaman dashboard before retrying.")
+    uuid = created.get("uuid")
+    if not uuid:
+        C.audit("payload-send", h, None, lock, tx["Account"],
+                "payload-create-no-uuid", note=f"identifier={identifier}",
+                spends=spends)
+        sys.exit("Xaman response had no payload UUID. Spend stays reserved; "
+                 "check the Xaman dashboard.")
+    tracker.bind_payload(rid, h, uuid)
+    nxt = created.get("next", {})
+    pushed = created.get("pushed")
+    print("=" * 60)
+    print("XAMAN SIGN REQUEST CREATED — nothing is signed yet.")
+    print("=" * 60)
+    print(f"  payload:  {uuid}")
+    print(f"  open:     {nxt.get('always')}")
+    print(f"  qr/fallback: {nxt.get('no_push_msg_received')}")
+    print(f"  pushed:   {pushed}")
+    if not pushed:
+        print("  (no push — open the link above on your phone, or scan the")
+        print("   QR inside Xaman. Push works after one prior interaction.)")
+    print("Approve or reject the tap in Xaman. Waiting for resolution…")
+    finish_payload(prop, tx, uuid, tracker, rid, key, secret, lock,
+                   args.expire_minutes * 60 + 120)
+
+
+def cmd_resume(args):
+    """Re-check a payload whose outcome is unknown (timeout/interrupt)."""
+    prop, path = C.load_proposal(args.hash)
+    try:
+        tx = C.verify_proposal(prop, path)
+    except C.ProposalError as e:
+        sys.exit(f"proposal verification FAILED: {e}")
+    tracker = C.SpentTracker()
+    pending = tracker.pending_for_proposal(prop["proposal_hash"])
+    if not pending:
+        sys.exit("No pending reservation for this proposal.")
+    entry = pending[0]
+    uuid = entry.get("payload_uuid")
+    if not uuid:
+        sys.exit("Pending reservation has no payload UUID. Check the Xaman "
+                 "dashboard and audit log before taking further action.")
+    key, secret = need_keys()
+    finish_payload(prop, tx, uuid, tracker, entry["rid"], key, secret,
+                   prop["network"], args.wait_seconds)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="xahau-payload",
+        description="Turn approved Xahau proposals into Xaman sign requests")
+    ap.add_argument("--list", action="store_true",
+                    help="list saved proposals")
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("list")
+    s = sub.add_parser("send")
+    s.add_argument("--hash", required=True,
+                   help="proposal hash prefix (human-approved)")
+    s.add_argument("--expire-minutes", type=int, default=15,
+                   help="payload expiry in minutes")
+    s = sub.add_parser("resume")
+    s.add_argument("--hash", required=True,
+                   help="proposal hash prefix (pending payload)")
+    s.add_argument("--wait-seconds", type=int, default=60,
+                   help="how long to wait for resolution before giving up")
+    args = ap.parse_args()
+    if args.list or args.cmd == "list":
+        cmd_list(args)
+    elif args.cmd == "send":
+        cmd_send(args)
+    elif args.cmd == "resume":
+        cmd_resume(args)
+    else:
+        ap.print_help()
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

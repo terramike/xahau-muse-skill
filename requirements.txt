@@ -1,0 +1,2 @@
+requests>=2.31
+xrpl-py==5.2.0

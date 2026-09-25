@@ -1,0 +1,434 @@
+#!/usr/bin/env python3
+"""xahau v0.1: reads + PROPOSER for the Xahau Muse skill.
+
+This program NEVER sees Xaman API credentials, NEVER signs, and NEVER
+submits a transaction. Write commands (send/trustline/claim) build the
+transaction, autofill it against the live Xahau network, print the full
+ceremony (network, account, assets+issuers, amounts, fee, sequence,
+expiry), and save a hash-bound proposal envelope.
+
+The separate `xahau-payload` program turns an approved proposal into a
+Xaman sign-request payload — the human approves the tap on their phone.
+
+Read-only: balance, quote, offers, network, reconcile.
+"""
+import argparse
+import json
+import os
+import sys
+import time
+from decimal import Decimal
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import xahau_common as C
+
+
+# ---------- config ----------
+
+def load_config():
+    cfg = {}
+    if C.CONFIG_PATH.exists():
+        cfg = json.loads(C.CONFIG_PATH.read_text())
+    cfg["address"] = os.environ.get("XAHAU_ADDRESS") or cfg.get("address")
+    cfg["network"] = os.environ.get("XAHAU_NETWORK") or cfg.get(
+        "network", "xahau-testnet")
+    if cfg["network"] not in C.NETWORKS:
+        sys.exit(f"unknown network {cfg['network']!r} "
+                 f"(choose from {sorted(C.NETWORKS)})")
+    return cfg
+
+
+def rpc(method, params=None):
+    return C.rpc(CFG["network"], method, params)
+
+
+# ---------- builders (pure: no network, no signing) ----------
+
+def make_amount(ccy, issuer, value: Decimal):
+    ccy = ccy.upper()
+    if ccy == C.NATIVE:
+        return C.xah_to_drops(value)
+    if not issuer:
+        sys.exit(f"issuer required for {ccy}")
+    return {"currency": C.currency_code(ccy), "issuer": issuer,
+            "value": format(value, "f")}
+
+
+def build_payment(account, to, amount: Decimal, ccy, issuer, dest_tag):
+    tx = {"Account": account, "TransactionType": "Payment",
+          "Destination": to, "Amount": make_amount(ccy, issuer, amount)}
+    if dest_tag is not None:
+        tx["DestinationTag"] = int(dest_tag)
+    return tx
+
+
+def build_trustline(account, ccy, issuer, limit: Decimal):
+    if ccy.upper() == C.NATIVE:
+        sys.exit("cannot trustline the native asset")
+    return {"Account": account, "TransactionType": "TrustSet",
+            "LimitAmount": {"currency": C.currency_code(ccy), "issuer": issuer,
+                            "value": format(limit, "f")}}
+
+
+def build_claim(account, issuer=None):
+    tx = {"Account": account, "TransactionType": "ClaimReward"}
+    if issuer:
+        tx["Issuer"] = issuer
+    return tx
+
+
+def autofill(tx, network):
+    """Fill Fee / Sequence / LastLedgerSequence / NetworkID from live RPC."""
+    info = C.rpc(network, "account_info",
+                 [{"account": tx["Account"], "ledger_index": "validated"}])
+    data = info.get("account_data")
+    if not data:
+        sys.exit(f"account_info failed for {tx['Account']}: {info}")
+    fee_info = C.rpc(network, "fee", [{}])
+    # Xahau's generic fee is 3x the advertised median fee (a base-fee-only
+    # transaction can be rejected with telINSUF_FEE_P when busy).
+    generic_fee = C.choose_fee(fee_info.get("drops", {}))
+    cur = C.rpc(network, "ledger", [{"ledger_index": "current"}])
+    tx["Sequence"] = data["Sequence"]  # rippled uses capitalized keys
+    cur_idx = cur.get("ledger_index") or cur.get("ledger_current_index")
+    tx["LastLedgerSequence"] = int(cur_idx) + 20
+    tx["NetworkID"] = C.NETWORK_IDS[network]
+    # A Hook on the destination can raise a payment's minimum fee far above
+    # the generic floor (verified live: a hook'd account required 14167
+    # drops while plain accounts required 10). Serialize the unsigned
+    # payment and ask the fee RPC for that specific transaction. Its
+    # `median_fee` is NOT a suitable multiplier here: it scales with the
+    # Hook-adjusted base and can be orders of magnitude too high.
+    if tx["TransactionType"] == "Payment":
+        fee_probe = dict(tx, Fee="0", SigningPubKey="")
+        try:
+            probe_blob = C.tx_binary_if_known(fee_probe)
+        except ImportError:
+            sys.exit("xrpl-py is not installed — run: pip install -r requirements.txt")
+        if not probe_blob:
+            sys.exit("Could not encode payment for Hook-aware fee estimate")
+        try:
+            specific = C.rpc(network, "fee", [{"tx_blob": probe_blob}])
+            drops = specific.get("drops") or {}
+            required = max(int(drops[k]) for k in
+                           ("base_fee", "minimum_fee", "open_ledger_fee")
+                           if k in drops)
+            tx["Fee"] = str(max(generic_fee, required))
+        except (KeyError, ValueError, RuntimeError, TypeError) as exc:
+            sys.exit(f"Hook-aware fee estimate unavailable: {exc}")
+    else:
+        tx["Fee"] = str(generic_fee)
+    # Binary-codec sanity where the codec knows the type (classic types).
+    # Xahau-only types bind via canonical JSON instead (see xahau_common).
+    try:
+        blob = C.tx_binary_if_known(tx)
+    except ImportError:
+        sys.exit("xrpl-py is not installed — run: pip install -r requirements.txt")
+    if blob is None and tx["TransactionType"] in (
+            "Payment", "OfferCreate", "OfferCancel", "TrustSet"):
+        sys.exit(f"BUG: classic tx type {tx['TransactionType']} did not encode")
+    return tx
+
+
+# ---------- ceremony ----------
+
+def propose(tx, action, summary_lines):
+    filled = autofill(tx, CFG["network"])
+    lines = [
+        f"network:  {CFG['network']} (NetworkID {filled['NetworkID']})",
+        f"account:  {filled['Account']}",
+        f"action:   {action}",
+        *summary_lines,
+        f"fee:      {C.drops_to_xah(filled['Fee'])} XAH",
+        f"sequence: {filled['Sequence']}",
+        f"last_ledger: {filled.get('LastLedgerSequence', 'n/a')}",
+    ]
+    if "Expiration" in filled:
+        exp = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                            time.gmtime(filled["Expiration"] + C.RIPPLE_EPOCH))
+        lines.append(f"expires:  {exp}")
+    h, path = C.save_proposal(filled, CFG["network"], filled["Account"], action)
+    print("=" * 60)
+    print("PROPOSAL — review carefully. Nothing has been submitted.")
+    print("=" * 60)
+    for ln in lines:
+        print("  " + ln)
+    print("=" * 60)
+    print(f"proposal hash: {h}")
+    print(f"\nA HUMAN must review the hash above, then run:")
+    print(f"  xahau-payload send --hash {h[:16]}")
+    print(f"  (you will scan a QR code and approve the tap in Xaman)")
+    print(f"\nFull autofilled transaction saved to:\n  {path}")
+    return h
+
+
+# ---------- read commands ----------
+
+def cmd_balance(args):
+    addr = args.address or CFG.get("address")
+    if not addr:
+        sys.exit("No address. Pass one or run `xahau setup`.")
+    info = rpc("account_info", [{"account": addr,
+                                 "ledger_index": "validated"}])
+    data = info.get("account_data")
+    if not data:
+        sys.exit(f"account_info failed: {info}")
+    bal = C.drops_to_xah(data["Balance"])
+    reserve = (C.RESERVE_BASE_DROPS + C.RESERVE_INC_DROPS
+               * int(data.get("OwnerCount", 0)))
+    print(f"XAH: {bal} (reserve locked: "
+          f"{C.drops_to_xah(reserve)} XAH over {data.get('OwnerCount', 0)} objects)")
+    lines = rpc("account_lines", [{"account": addr,
+                                   "ledger_index": "validated"}])
+    for l in lines.get("lines", []):
+        if Decimal(l["balance"]) != 0:
+            print(f"{C.display_currency(l['currency'])}."
+                  f"{C.short_addr(l['account'])}: {l['balance']} "
+                  f"(limit {l['limit']})")
+
+
+def book_side(gets, pays, limit):
+    r = rpc("book_offers", [{"taker_gets": gets, "taker_pays": pays,
+                             "limit": limit, "ledger_index": "validated"}])
+    return r.get("offers", [])
+
+
+def amt_value(a):
+    if isinstance(a, dict):
+        return Decimal(a["value"]), C.display_currency(a["currency"])
+    return C.drops_to_xah(a), C.NATIVE
+
+
+def fmt_amt(a):
+    if isinstance(a, dict):
+        return f"{a['value']} {C.display_currency(a['currency'])}"
+    return f"{C.drops_to_xah(a)} XAH"
+
+
+def cmd_quote(args):
+    base, base_iss = args.base.upper(), args.base_issuer
+    quote, quote_iss = args.quote.upper(), args.quote_issuer
+    bg = {"currency": base, **({"issuer": base_iss} if base_iss else {})}
+    qg = {"currency": quote, **({"issuer": quote_iss} if quote_iss else {})}
+    asks = book_side(bg, qg, args.limit)
+    bids = book_side(qg, bg, args.limit)
+    print(f"--- {base}/{quote} asks (sell {base}) ---")
+    for o in asks or ["(empty)"]:
+        if o == "(empty)":
+            print("  (empty)"); break
+        qv, _ = amt_value(o["TakerPays"]); bv, _ = amt_value(o["TakerGets"])
+        print(f"  {fmt_amt(o['TakerGets'])} @ {qv / bv:.6f} {quote}")
+    print(f"--- {base}/{quote} bids (buy {base}) ---")
+    for o in bids or ["(empty)"]:
+        if o == "(empty)":
+            print("  (empty)"); break
+        qv, _ = amt_value(o["TakerGets"]); bv, _ = amt_value(o["TakerPays"])
+        print(f"  {fmt_amt(o['TakerPays'])} @ {qv / bv:.6f} {quote}")
+
+
+def cmd_offers(args):
+    addr = args.address or CFG.get("address")
+    if not addr:
+        sys.exit("No address. Pass one or run `xahau setup`.")
+    r = rpc("account_offers", [{"account": addr,
+                                "ledger_index": "validated"}])
+    offers = r.get("offers", [])
+    print(f"{len(offers)} open offer(s) for {C.short_addr(addr)}")
+    for o in offers:
+        print(f"  seq {o['seq']}: give {fmt_amt(o['taker_gets'])} / "
+              f"get {fmt_amt(o['taker_pays'])}")
+
+
+def cmd_hook(args):
+    """List installed Hooks and decode their parameters.
+
+    A Hook's parameters (e.g. an AMOUNT it demands) belong to that Hook's
+    code — this shows the raw values, decoded where unambiguous.
+    """
+    addr = args.address or CFG.get("address")
+    if not addr:
+        sys.exit("No address. Pass one or run `xahau setup`.")
+    objects = rpc("account_objects", [{"account": addr,
+                                       "ledger_index": "validated",
+                                       "type": "hook"}])
+    hooks = [hook.get("Hook", {}) for obj in objects.get("account_objects", [])
+             for hook in obj.get("Hooks", [])]
+    print(f"{len(hooks)} Hook(s) on {addr}")
+    for hook in hooks:
+        print(f"hash: {hook.get('HookHash', '?')}")
+        for entry in hook.get("HookParameters", []):
+            param = entry.get("HookParameter", {})
+            name_hex = param.get("HookParameterName", "")
+            value = param.get("HookParameterValue", "")
+            try:
+                name = bytes.fromhex(name_hex).decode("utf-8", "replace")
+            except ValueError:
+                name = name_hex
+            print(f"  {name}: {value}")
+            if name == "AMOUNT" and len(value) == 16:
+                integer = int(value, 16)
+                print(f"    {integer} as a big-endian integer "
+                      f"({C.drops_to_xah(integer)} XAH if this Hook uses drops)")
+
+
+def cmd_network(args):
+    r = rpc("server_info", [{}])
+    info = r.get("info", {})
+    vl = info.get("validated_ledger", {})
+    # NOTE: on Xahau server_info reports reserves in whole XAH (not drops)
+    # and base_fee_xrp as XAH — unlike classic rippled drops conventions.
+    base_fee_drops = int(Decimal(str(vl.get("base_fee_xrp", 0))) * 1_000_000)
+    print(f"network:      {CFG['network']} "
+          f"(NetworkID {C.NETWORK_IDS[CFG['network']]})")
+    print(f"build:        {info.get('build_version', '?')}")
+    print(f"ledger:       {vl.get('seq', '?')}")
+    print(f"base fee:     {base_fee_drops} drops")
+    print(f"reserve base: {vl.get('reserve_base_native', '?')} XAH")
+    print(f"reserve incr: {vl.get('reserve_inc_native', '?')} XAH / object")
+
+
+def cmd_reconcile(args):
+    r = rpc("tx", [{"transaction": args.hash}])
+    meta = r.get("meta") or {}
+    result = meta.get("TransactionResult", "n/a")
+    print(f"hash:      {r.get('hash', args.hash)}")
+    print(f"validated: {r.get('validated')}")
+    print(f"result:    {result}")
+    print(f"type:      {r.get('TransactionType', 'n/a')}")
+    print(f"account:   {r.get('Account', 'n/a')}")
+    print(f"fee:       {C.drops_to_xah(r.get('Fee', '0'))} XAH")
+    print(f"ledger:    {r.get('ledger_index', 'n/a')}")
+    if r.get("validated") and result != "tesSUCCESS":
+        print("outcome:   validated failure; the transaction fee was charged")
+    for account, message in C.hook_messages(r):
+        print(f"hook ({account}): {message}")
+    if result == "tecHOOK_REJECTED":
+        print()
+        for line in C.hook_diagnostics(rpc, r):
+            print(line)
+
+# ---------- write commands (propose only) ----------
+
+def need_account(args):
+    addr = args.address or CFG.get("address")
+    if not addr:
+        sys.exit("No address. Pass --address or run `xahau setup`.")
+    if not C.is_valid_classic_address(addr):
+        sys.exit(f"not a valid Xahau address: {addr!r}")
+    return addr
+
+
+def cmd_send(args):
+    acct = need_account(args)
+    if not C.is_valid_classic_address(args.to):
+        sys.exit(f"not a valid destination: {args.to!r}")
+    hooks = C.destination_hook_count(CFG["network"], args.to)
+    if hooks and not args.allow_hooks:
+        sys.exit(
+            f"destination {args.to} has {hooks} Hook(s) installed. A Hook can "
+            "reject or redirect your payment (e.g. an NFT-vending hook that "
+            "only accepts exact amounts). Re-run with --allow-hooks if you "
+            "understand what that Hook does.")
+    amount = C.dec(args.amount, "amount")
+    ccy = (args.ccy or "XAH").upper()
+    tx = build_payment(acct, args.to, amount, ccy, args.issuer,
+                       args.destination_tag)
+    extra = []
+    if args.to == acct:
+        extra.append("WARNING:  self-payment (to == from) — moves nothing but "
+                     "the fee; Xaman flags this as redundant")
+    if hooks:
+        extra.append(f"WARNING:  destination has {hooks} Hook(s) installed "
+                     "(--allow-hooks given)")
+    propose(tx, "send",
+            [f"amount:   {amount} {ccy}"
+             + (f".{C.short_addr(args.issuer)}" if args.issuer else ""),
+             f"to:       {C.short_addr(args.to)}",
+             f"dest tag: {args.destination_tag or 'NONE'}",
+             *extra])
+
+
+def cmd_trustline(args):
+    acct = need_account(args)
+    if not C.is_valid_classic_address(args.issuer):
+        sys.exit(f"not a valid issuer: {args.issuer!r}")
+    limit = C.dec(args.limit, "limit")
+    tx = build_trustline(acct, args.ccy, args.issuer, limit)
+    propose(tx, "trustline",
+            [f"token:    {args.ccy.upper()}.{C.short_addr(args.issuer)}",
+             f"limit:    {limit}"])
+
+
+def cmd_claim(args):
+    acct = need_account(args)
+    tx = build_claim(acct, args.issuer)
+    propose(tx, "claim", ["effect:   claim monthly XAH balance reward"])
+
+
+def cmd_setup(args):
+    C.XAHAU_DIR.mkdir(parents=True, exist_ok=True)
+    cfg = {}
+    if C.CONFIG_PATH.exists():
+        cfg = json.loads(C.CONFIG_PATH.read_text())
+    if args.address:
+        cfg["address"] = args.address
+    if args.network:
+        if args.network not in C.NETWORKS:
+            sys.exit(f"unknown network (choose from {sorted(C.NETWORKS)})")
+        cfg["network"] = args.network
+    cfg.setdefault("network", "xahau-testnet")
+    C.CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n")
+    os.chmod(C.CONFIG_PATH, 0o600)
+    print(f"wrote {C.CONFIG_PATH}: {cfg} (address+network only, never keys)")
+
+
+def cmd_init_policy(args):
+    p = C.write_default_policy()
+    print(f"wrote {p} (0600). Review it, then add:")
+    print("  - spend_limits for every asset you will move (fail-closed)")
+    print("  - destination_allowlist entries (empty = no payments)")
+    print("  - network_lock stays 'xahau-testnet' until you deliberately opt in")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="xahau",
+                                 description="Xahau reads + proposer (never signs)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("setup"); s.add_argument("--address"); s.add_argument("--network")
+    s = sub.add_parser("init-policy")
+    s = sub.add_parser("balance"); s.add_argument("address", nargs="?")
+    s = sub.add_parser("quote")
+    s.add_argument("--base", default="XAH"); s.add_argument("--base-issuer")
+    s.add_argument("--quote", required=True); s.add_argument("--quote-issuer")
+    s.add_argument("--limit", type=int, default=10)
+    s = sub.add_parser("offers"); s.add_argument("address", nargs="?")
+    s = sub.add_parser("hook"); s.add_argument("address", nargs="?")
+    s = sub.add_parser("network")
+    s = sub.add_parser("reconcile"); s.add_argument("--hash", required=True)
+
+    s = sub.add_parser("send")
+    s.add_argument("--to", required=True); s.add_argument("--amount", required=True)
+    s.add_argument("--ccy", default="XAH"); s.add_argument("--issuer")
+    s.add_argument("--destination-tag", type=int); s.add_argument("--address")
+    s.add_argument("--allow-hooks", action="store_true",
+                   help="proceed even if the destination has Hooks installed")
+    s = sub.add_parser("trustline")
+    s.add_argument("--ccy", required=True); s.add_argument("--issuer", required=True)
+    s.add_argument("--limit", required=True); s.add_argument("--address")
+    s = sub.add_parser("claim"); s.add_argument("--issuer"); s.add_argument("--address")
+
+    args = ap.parse_args()
+    global CFG
+    CFG = load_config()
+    {"setup": cmd_setup, "init-policy": cmd_init_policy,
+     "balance": cmd_balance, "quote": cmd_quote, "offers": cmd_offers,
+     "hook": cmd_hook, "network": cmd_network, "reconcile": cmd_reconcile,
+     "send": cmd_send, "trustline": cmd_trustline,
+     "claim": cmd_claim}[args.cmd](args)
+
+
+CFG = {}
+if __name__ == "__main__":
+    main()
