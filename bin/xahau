@@ -269,6 +269,32 @@ def build_trustline(account, ccy, issuer, limit: Decimal):
 # (the ledger rejects a claim with no Issuer as temMALFORMED).
 GENESIS_ACCOUNT = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"
 
+# Monthly balance-adjustment timing: minimum gap between reward claims.
+RIPPLE_EPOCH_OFFSET = 946684800  # seconds between Unix and ledger epochs
+REWARD_DELAY_SECONDS = 2599980   # 30 days, 2 hours, 13 minutes
+
+
+def reward_wait_seconds(acct):
+    """Seconds until `acct` may claim its reward again; 0 when claimable.
+
+    A premature ClaimReward is rejected by the reward hook
+    (tecHOOK_REJECTED, 'you must wait N seconds') and still burns the fee,
+    so callers refuse to propose when this returns > 0. Returns 0 when the
+    account never opted in (the first claim IS the opt-in) and when the
+    timing cannot be checked — the ledger stays the final arbiter.
+    """
+    try:
+        info = C.rpc(CFG["network"], "account_info",
+                     [{"account": acct, "ledger_index": "validated"}])
+        rt = (info.get("account_data") or {}).get("RewardTime")
+    except Exception as e:
+        print(f"warning: could not check reward timing ({e}); proceeding")
+        return 0
+    if not rt:
+        return 0
+    now = int(time.time()) - RIPPLE_EPOCH_OFFSET
+    return max(0, (rt + REWARD_DELAY_SECONDS) - now)
+
 
 def build_claim(account, issuer=None):
     issuer = issuer or GENESIS_ACCOUNT
@@ -622,6 +648,14 @@ def cmd_trustline(args):
 
 def cmd_claim(args):
     acct = need_account(args)
+    wait = reward_wait_seconds(acct)
+    if wait > 0:
+        due = time.strftime("%Y-%m-%d %H:%M UTC",
+                            time.gmtime(time.time() + wait))
+        sys.exit(f"reward not claimable yet: the hook requires a "
+                 f"{REWARD_DELAY_SECONDS}s gap between claims — you must "
+                 f"wait {wait} more seconds (until ~{due}). Refusing to "
+                 f"propose: a premature claim burns the fee.")
     tx = build_claim(acct, args.issuer)
     propose(tx, "claim", ["effect:   claim monthly XAH balance reward"])
 

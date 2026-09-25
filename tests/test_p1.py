@@ -435,6 +435,44 @@ check("claim with explicit issuer keeps it",
 check("claim refuses issuer == account (temMALFORMED)",
       _refused(lambda: X.build_claim(ACCT, ACCT)))
 
+# ---- reward timing guard: never propose a claim the hook would reject ----
+_REAL_RPC = X.C.rpc
+_REAL_CFG = X.CFG
+X.CFG = {"network": "xahau-testnet"}  # main() populates this on real runs
+_NOW_RIPPLE = int(time.time()) - X.RIPPLE_EPOCH_OFFSET
+
+
+def _rpc_reward(rt):
+    def _fake(net, cmd, params):
+        assert cmd == "account_info"
+        return {"account_data": {"RewardTime": rt} if rt else {}}
+    return _fake
+
+
+X.C.rpc = _rpc_reward(_NOW_RIPPLE - 1000)  # claimed ~17 min ago
+wait = X.reward_wait_seconds(ACCT)
+check("claim timing refuses a premature claim",
+      X.REWARD_DELAY_SECONDS - 2000 < wait <= X.REWARD_DELAY_SECONDS)
+
+X.C.rpc = _rpc_reward(_NOW_RIPPLE - X.REWARD_DELAY_SECONDS - 10)
+check("claim timing allows a due claim",
+      X.reward_wait_seconds(ACCT) == 0)
+
+X.C.rpc = _rpc_reward(None)  # never opted in: first claim is the opt-in
+check("claim timing allows the opt-in claim",
+      X.reward_wait_seconds(ACCT) == 0)
+
+
+def _rpc_boom(net, cmd, params):
+    raise RuntimeError("node down")
+
+
+X.C.rpc = _rpc_boom
+check("claim timing degrades gracefully when the node is unreachable",
+      X.reward_wait_seconds(ACCT) == 0)
+X.C.rpc = _REAL_RPC
+X.CFG = _REAL_CFG
+
 fails = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(fails)}/{len(PASS)} passed")
 sys.exit(1 if fails else 0)
