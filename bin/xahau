@@ -56,6 +56,9 @@ def make_amount(ccy, issuer, value: Decimal):
 
 
 def build_payment(account, to, amount: Decimal, ccy, issuer, dest_tag):
+    if to == account:
+        sys.exit("Payment to self is redundant (temREDUNDANT) — the ledger "
+                 "rejects it and no fee is charged. Use two distinct accounts.")
     tx = {"Account": account, "TransactionType": "Payment",
           "Destination": to, "Amount": make_amount(ccy, issuer, amount)}
     if dest_tag is not None:
@@ -561,9 +564,6 @@ def cmd_send(args):
     tx = build_payment(acct, args.to, amount, ccy, args.issuer,
                        args.destination_tag)
     extra = []
-    if args.to == acct:
-        extra.append("WARNING:  self-payment (to == from) — moves nothing but "
-                     "the fee; Xaman flags this as redundant")
     if hooks:
         extra.append(f"WARNING:  destination has {hooks} Hook(s) installed "
                      "(--allow-hooks given)")

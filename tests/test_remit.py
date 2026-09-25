@@ -98,6 +98,12 @@ check("build: DestinationTag set", tx2.get("DestinationTag") == 42)
 
 check("build: self-remit refused (temREDUNDANT)",
       exits(lambda: X.build_remit(ALICE, ALICE, ["1 XAH"], None)))
+check("build: self-payment refused (temREDUNDANT)",
+      exits(lambda: X.build_payment(ALICE, ALICE, Decimal("1"), "XAH",
+                                   None, None)))
+txp = X.build_payment(ALICE, BOB, Decimal("1"), "XAH", None, None)
+check("build: distinct-account payment still builds",
+      txp["Destination"] == BOB and txp["Amount"] == "1000000")
 check("build: duplicate XAH refused",
       exits(lambda: X.build_remit(ALICE, BOB, ["1 XAH", "2 XAH"], None)))
 check("build: duplicate IOU refused",
