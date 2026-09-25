@@ -67,9 +67,9 @@ Without a phone tap, nothing moves. Ever.
 - `network_lock` — default `xahau-testnet`. The emergency brake.
   Mainnet proposals hard-fail until you explicitly opt in.
 - `allowed_tx_types` — `Payment`, `OfferCreate`, `OfferCancel`,
-  `TrustSet`, `URITokenMint`, `URITokenBuy`, `URITokenBurn`, `SetHook`,
-  `Remit`, `ClaimReward`, `Import`. This matches Xahau's live amendment
-  set (verified via the `feature` RPC): **no** Escrow, PayChans,
+  `TrustSet`, `URITokenMint`, `URITokenBuy`, `URITokenBurn`,
+  `Remit`, `ClaimReward`, `Import`. This matches the builders the skill
+  ships (verified via the `feature` RPC): **no** Escrow, PayChans,
   MultiSign, XLS-20 NFTs, or AMM — they are disabled on Xahau.
 - `spend_limits` — per-asset `{per_tx, per_day}` caps with a true
   rolling-24h window, reserved atomically under a file lock. Assets with
@@ -125,8 +125,16 @@ Writing (always propose → human reviews hash → payload → phone tap):
 
 Honest scope: `Payment`, `TrustSet`, `ClaimReward`, `Remit`, `Import`,
 and `URITokenMint` / `URITokenBuy` / `URITokenBurn` builders are
-implemented — the policy allowlist matches. `SetHook` is planned and
-refused by default policy until then.
+implemented — the policy allowlist matches.
+
+Out of scope by design: `SetHook` (hook installation). Installing a
+hook puts persistent, unauditable WASM on the account — a bad hook can
+lock funds or brick the account, and a phone-tap approval cannot
+meaningfully review bytecode. This skill is for people doing payments
+and commerce, not hook developers (who already have the toolchain).
+Hook *awareness* — inspection, destination gating, rejection
+diagnostics, hook-aware fees — is fully supported; hook *installation*
+is not, and won't be.
 
 ### xMerch storefronts (`bin/xmerch`)
 

@@ -61,8 +61,7 @@ payload manager, and the phone tap is the real approval.
    reports validated result via public RPC `tx` lookup -> appends to audit log.
 3. Policy (`~/.xahau/policy.json`): tx-type allowlist adjusted for Xahau
    (OfferCreate/OfferCancel/TrustSet/Payment/URITokenMint/URITokenBuy/
-   URITokenBurn/URITokenCancelSellOffer?/SetHook?/Remit/ClaimReward — to be
-   locked), per-asset per-tx + rolling-24h spend limits (fail-closed),
+   URITokenBurn/Remit/ClaimReward/Import — locked), per-asset per-tx + rolling-24h spend limits (fail-closed),
    destination allowlist, network lock (testnet default, mainnet hard-fail
    until opt-in). Policy gates payload CREATION; the phone tap is the human
    approval; proposal-hash review in chat is the pre-check.
@@ -196,5 +195,8 @@ accounting, hook gate, 41/41 tests, live testnet proposal verified;
 URITokens done 2026-09-24 — mint/buy/burn builders, exact price-match and
 ownership ledger pre-checks, 0.2 XAH reserve-lock warning, 47/47 tests,
 live testnet proposal verified):**
-Import/Burn2Mint, SetHook (default-deny recommended), deeper
-xMerch. Not published to GitHub.
+Import/Burn2Mint (done 2026-09-25, Option A — manual XPOP), deeper
+xMerch. SetHook deliberately cut 2026-09-25: hook installation is
+persistent unauditable code — wrong risk profile for a user-friendly
+payments/commerce skill; hook *awareness* stays. Published to GitHub
+(terramike/xahau-muse-skill).
