@@ -112,6 +112,148 @@ def build_remit(account, to, specs, dest_tag):
     return tx
 
 
+def uri_to_hex(uri_text=None, uri_hex=None):
+    """URI -> uppercase hex. Text is UTF-8 encoded; pre-encoded hex passes
+    --uri-hex. Enforces the 256-byte ledger limit."""
+    if (uri_text is None) == (uri_hex is None):
+        sys.exit("pass exactly one of --uri (text) or --uri-hex")
+    if uri_hex is not None:
+        h = uri_hex.strip()
+        if len(h) % 2 or not all(c in "0123456789abcdefABCDEF" for c in h):
+            sys.exit("Bad --uri-hex: must be valid hex")
+        raw = bytes.fromhex(h)
+    else:
+        raw = uri_text.encode("utf-8")
+    if len(raw) > 256:
+        sys.exit(f"URI is {len(raw)} bytes — the ledger allows 256 max")
+    if not raw:
+        sys.exit("URI must not be empty")
+    return raw.hex().upper()
+
+
+def build_uritoken_mint(account, uri_hex, digest=None, burnable=False,
+                        price_spec=None, destination=None):
+    tx = {"Account": account, "TransactionType": "URITokenMint",
+          "URI": uri_hex}
+    if digest is not None:
+        d = digest.strip()
+        if not C.is_valid_token_id(d):
+            sys.exit("Bad --digest: must be 64 hex chars")
+        tx["Digest"] = d.upper()
+    if burnable:
+        tx["Flags"] = 1  # tfBurnable
+    if price_spec is not None:
+        ccy, issuer, value = parse_amount_spec(price_spec)
+        tx["Amount"] = make_amount(ccy, issuer, value)
+    if destination is not None:
+        if not C.is_valid_classic_address(destination):
+            sys.exit(f"not a valid --destination: {destination!r}")
+        tx["Destination"] = destination
+    return tx
+
+
+def build_uritoken_buy(account, token_id, amount_spec):
+    if not C.is_valid_token_id(token_id):
+        sys.exit("Bad --token-id: must be 64 hex chars")
+    ccy, issuer, value = parse_amount_spec(amount_spec)
+    return {"Account": account, "TransactionType": "URITokenBuy",
+            "URITokenID": token_id.upper(),
+            "Amount": make_amount(ccy, issuer, value)}
+
+
+def build_uritoken_burn(account, token_id):
+    if not C.is_valid_token_id(token_id):
+        sys.exit("Bad --token-id: must be 64 hex chars")
+    return {"Account": account, "TransactionType": "URITokenBurn",
+            "URITokenID": token_id.upper()}
+
+
+def amount_to_spec(a):
+    """Ledger amount -> re-runnable --amount spec ('1 XAH' / '10 USD.rISS…')."""
+    if isinstance(a, str):  # native, in drops
+        return f"{C.drops_to_xah(a)} XAH"
+    return f"{a['value']} {C.display_currency(a['currency'])}.{a['issuer']}"
+
+
+def fetch_uritoken(network, token_id):
+    """Ledger URIToken entry by ID. Fail-closed: exit if missing/unreadable."""
+    try:
+        r = C.rpc(network, "ledger_entry",
+                  [{"index": token_id.upper(), "ledger_index": "validated"}])
+    except Exception as e:  # noqa: BLE001
+        sys.exit(f"could not read URIToken {token_id[:16]}…: {e}")
+    node = r.get("node", {})
+    if node.get("LedgerEntryType") != "URIToken":
+        sys.exit(f"URIToken {token_id[:16]}… not found on {network} — refusing")
+    return node
+
+
+def cmd_uritoken_mint(args):
+    acct = need_account(args)
+    uri_hex = uri_to_hex(args.uri, args.uri_hex)
+    tx = build_uritoken_mint(acct, uri_hex, args.digest, args.burnable,
+                             args.price, args.destination)
+    try:
+        uri_txt = bytes.fromhex(uri_hex).decode("utf-8")
+    except ValueError:
+        uri_txt = uri_hex
+    lines = [f"uri:      {uri_txt[:80]}",
+             "WARNING:  minting locks 0.2 XAH reserve per URIToken "
+             "(released on burn)"]
+    if args.digest:
+        lines.append(f"digest:   {args.digest[:16]}…")
+    if args.burnable:
+        lines.append("burnable: yes — the issuer may destroy this token")
+    if args.price:
+        lines.append(f"price:    {args.price} (listed for sale at mint)")
+    if args.destination:
+        lines.append(f"buyer:    {C.short_addr(args.destination)} (restricted)")
+    propose(tx, "uritoken-mint", lines)
+
+
+def cmd_uritoken_buy(args):
+    acct = need_account(args)
+    token_id = args.token_id.strip()
+    node = fetch_uritoken(CFG["network"], token_id)
+    listing = node.get("Amount")
+    if not listing:
+        sys.exit(f"URIToken {token_id[:16]}… is not listed for sale — refusing")
+    restricted = node.get("Destination")
+    if restricted and restricted != acct:
+        sys.exit(f"URIToken {token_id[:16]}… is restricted to buyer "
+                 f"{C.short_addr(restricted)} — refusing")
+    ccy, issuer, value = parse_amount_spec(args.amount)
+    if not C.amounts_equal(make_amount(ccy, issuer, value), listing):
+        sys.exit(f"listing price is {C.fmt_amount(listing)} — re-run with "
+                 f"--amount {amount_to_spec(listing)!r} for the exact price")
+    tx = build_uritoken_buy(acct, token_id, args.amount)
+    propose(tx, "uritoken-buy",
+            [f"token id: {token_id[:16]}…",
+             f"price:    {C.fmt_amount(listing)} (matches listing exactly)",
+             f"seller:   {C.short_addr(node.get('Owner', ''))}"])
+
+
+def cmd_uritoken_burn(args):
+    acct = need_account(args)
+    token_id = args.token_id.strip()
+    node = fetch_uritoken(CFG["network"], token_id)
+    owner, issuer = node.get("Owner"), node.get("Issuer")
+    extra = []
+    if acct == owner:
+        pass
+    elif acct == issuer:
+        extra.append("WARNING:  issuer burn — the token must have been "
+                     "minted burnable or the ledger rejects it (fee consumed)")
+    else:
+        sys.exit(f"you are neither owner ({C.short_addr(owner or '')}) nor "
+                 f"issuer of URIToken {token_id[:16]}… — refusing")
+    tx = build_uritoken_burn(acct, token_id)
+    propose(tx, "uritoken-burn",
+            [f"token id: {token_id[:16]}…",
+             "effect:   permanently destroys the URIToken",
+             *extra])
+
+
 def build_trustline(account, ccy, issuer, limit: Decimal):
     if ccy.upper() == C.NATIVE:
         sys.exit("cannot trustline the native asset")
@@ -506,6 +648,22 @@ def main():
     s.add_argument("--ccy", required=True); s.add_argument("--issuer", required=True)
     s.add_argument("--limit", required=True); s.add_argument("--address")
     s = sub.add_parser("claim"); s.add_argument("--issuer"); s.add_argument("--address")
+    s = sub.add_parser("uritoken-mint")
+    s.add_argument("--uri", help="URI text (UTF-8 encoded to hex)")
+    s.add_argument("--uri-hex", help="URI already hex-encoded")
+    s.add_argument("--digest", help="64-hex digest of the token content")
+    s.add_argument("--burnable", action="store_true",
+                   help="let the issuer destroy the token later")
+    s.add_argument("--price",
+                   help="list for sale at mint: \"VALUE CCY\" or \"VALUE CCY.ISSUER\"")
+    s.add_argument("--destination", help="restrict purchase to this buyer")
+    s.add_argument("--address")
+    s = sub.add_parser("uritoken-buy")
+    s.add_argument("--token-id", required=True); s.add_argument("--amount", required=True,
+                   help="exact listing price: \"VALUE CCY\" or \"VALUE CCY.ISSUER\"")
+    s.add_argument("--address")
+    s = sub.add_parser("uritoken-burn")
+    s.add_argument("--token-id", required=True); s.add_argument("--address")
 
     args = ap.parse_args()
     global CFG
@@ -514,7 +672,9 @@ def main():
      "balance": cmd_balance, "quote": cmd_quote, "offers": cmd_offers,
      "hook": cmd_hook, "network": cmd_network, "reconcile": cmd_reconcile,
      "send": cmd_send, "trustline": cmd_trustline, "remit": cmd_remit,
-     "claim": cmd_claim}[args.cmd](args)
+     "claim": cmd_claim, "uritoken-mint": cmd_uritoken_mint,
+     "uritoken-buy": cmd_uritoken_buy,
+     "uritoken-burn": cmd_uritoken_burn}[args.cmd](args)
 
 
 CFG = {}

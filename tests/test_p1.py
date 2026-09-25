@@ -212,11 +212,15 @@ with tempfile.TemporaryDirectory() as td:
     mint_bad = dict(mint); mint_bad["Bogus"] = 1
     check("URITokenMint + bogus field rejected",
           C.validate_tx_shape(mint_bad, wide) != [])
+    check("URITokenMint now implemented: in default allowlist",
+          "URITokenMint" in C.DEFAULT_ALLOWED_TX_TYPES
+          and C.validate_tx_shape(mint, C.DEFAULT_ALLOWED_TX_TYPES) == [])
     check("narrowed default allowlist refuses unimplemented tx types",
-          "URITokenMint" not in C.DEFAULT_ALLOWED_TX_TYPES
+          "NFTokenMint" not in C.DEFAULT_ALLOWED_TX_TYPES
           and any("allowlist" in d
-                  for d in C.validate_tx_shape(mint,
-                                                C.DEFAULT_ALLOWED_TX_TYPES)))
+                  for d in C.validate_tx_shape(
+                      dict(mint, TransactionType="NFTokenMint"),
+                      C.DEFAULT_ALLOWED_TX_TYPES)))
 
     nan_tx = pay_tx(Amount="NaN")
     check("NaN amount rejected", C.validate_amounts(nan_tx) != [])

@@ -181,6 +181,31 @@ def is_valid_classic_address(addr: str) -> bool:
         return isinstance(addr, str) and addr.startswith("r")
 
 
+def is_valid_token_id(s: str) -> bool:
+    """URITokenIDs are 256-bit hashes: 64 hex chars."""
+    return (isinstance(s, str) and len(s) == 64
+            and all(c in "0123456789abcdefABCDEF" for c in s))
+
+
+def amounts_equal(a, b) -> bool:
+    """Exact amount equality: same currency, issuer, and value.
+
+    Used for the URITokenBuy price-match pre-check — the ledger rejects
+    underpayment (tecINSUFFICIENT_PAYMENT) and wrong currency
+    (temBAD_CURRENCY), so the skill demands the exact listing price.
+    """
+    if isinstance(a, str) or isinstance(b, str):
+        return isinstance(a, str) and isinstance(b, str) and a == b
+    if not (isinstance(a, dict) and isinstance(b, dict)):
+        return False
+    try:
+        return (a["currency"].upper() == b["currency"].upper()
+                and a["issuer"] == b["issuer"]
+                and Decimal(str(a["value"])) == Decimal(str(b["value"])))
+    except (KeyError, InvalidOperation, ValueError, TypeError):
+        return False
+
+
 # ---------- canonical hashing / proposal envelopes ----------
 
 def canonical_tx_bytes(tx: dict) -> bytes:
@@ -374,6 +399,12 @@ def describe_tx(tx: dict, action_hint: str = "?") -> list:
         lines += [f"uri:      {uri_txt[:80]}"]
         if tx.get("Digest"):
             lines += [f"digest:   {tx['Digest'][:16]}…"]
+        if tx.get("Flags") == 1:
+            lines += ["burnable: yes (issuer may destroy)"]
+        if tx.get("Amount"):
+            lines += [f"price:    {fmt_amount(tx['Amount'])} (listed for sale)"]
+        if tx.get("Destination"):
+            lines += [f"buyer:    {short_addr(tx['Destination'])} (restricted)"]
     elif ttype == "URITokenBuy":
         lines += [f"token id: {tx.get('URITokenID', '')[:16]}…",
                   f"price:    {fmt_amount(tx['Amount'])}"]
@@ -435,9 +466,10 @@ ALLOWED_FIELDS = {
     "OfferCreate": COMMON_FIELDS | {"TakerPays", "TakerGets", "Expiration"},
     "OfferCancel": COMMON_FIELDS | {"OfferSequence"},
     "TrustSet": COMMON_FIELDS | {"LimitAmount"},
-    "URITokenMint": COMMON_FIELDS | {"URI", "Digest", "Flags"},
+    "URITokenMint": COMMON_FIELDS | {"URI", "Digest", "Flags", "Destination",
+                                     "Amount"},
     "URITokenBuy": COMMON_FIELDS | {"URITokenID", "Amount"},
-    "URITokenBurn": COMMON_FIELDS | {"URITokenID", "Holder"},
+    "URITokenBurn": COMMON_FIELDS | {"URITokenID"},
     "SetHook": COMMON_FIELDS | {"CreateCode", "Flags", "HookOn",
                                 "HookNamespace", "HookApiVersion",
                                 "HookParameters", "HookGrants"},
@@ -452,7 +484,8 @@ ALLOWED_FIELDS = {
 # BalanceRewards); disabled — AMM, Escrow, PayChan, MultiSign, XLS-20,
 # TickSize. The skill's allowlist MUST NOT include the disabled types.
 # Enable only types with implemented builders and complete spend accounting.
-DEFAULT_ALLOWED_TX_TYPES = ["Payment", "TrustSet", "ClaimReward", "Remit"]
+DEFAULT_ALLOWED_TX_TYPES = ["Payment", "TrustSet", "ClaimReward", "Remit",
+                            "URITokenMint", "URITokenBuy", "URITokenBurn"]
 
 
 def validate_tx_shape(tx: dict, allowed_types) -> list:
@@ -544,6 +577,12 @@ def validate_amounts(tx: dict) -> list:
         p = num(tx.get("Amount"), "Amount")
         if p:
             problems.append(p)
+    elif ttype == "URITokenMint":
+        # Amount is the optional mint-and-list sell price.
+        if tx.get("Amount") is not None:
+            p = num(tx.get("Amount"), "Amount")
+            if p:
+                problems.append(p)
     elif ttype == "Remit":
         for i, entry in enumerate(tx.get("Amounts", []) or []):
             inner = entry.get("AmountEntry") if isinstance(entry, dict) else None

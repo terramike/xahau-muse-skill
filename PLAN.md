@@ -192,7 +192,9 @@ AMOUNT requirement; fee probe paid 0.015 XAH correctly for both hook'd
 and plain destinations on testnet.
 
 **P2 (Remit done 2026-09-24 — builder, shape schema, multi-asset spend
-accounting, hook gate, 41/41 tests, live testnet proposal verified):**
-Import/Burn2Mint,
-URIToken mint/buy/burn, SetHook (default-deny recommended), deeper
+accounting, hook gate, 41/41 tests, live testnet proposal verified;
+URITokens done 2026-09-24 — mint/buy/burn builders, exact price-match and
+ownership ledger pre-checks, 0.2 XAH reserve-lock warning, 47/47 tests,
+live testnet proposal verified):**
+Import/Burn2Mint, SetHook (default-deny recommended), deeper
 xMerch. Not published to GitHub.

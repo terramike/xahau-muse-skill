@@ -111,13 +111,17 @@ Writing (always propose → human reviews hash → payload → phone tap):
   `--allow-hooks` is given (a Hook can reject or redirect your payment)
 - `trustline --ccy USD --issuer r… --limit N`
 - `claim [--issuer r…]` — monthly XAH balance reward
+- `uritoken-mint --uri <text> | --uri-hex <hex> [--digest <64hex>]`
+  `[--burnable] [--price "VALUE CCY[.ISSUER]"] [--destination r…]`
+- `uritoken-buy --token-id <64hex> --amount "VALUE CCY[.ISSUER]"`
+- `uritoken-burn --token-id <64hex>`
 - `xahau-payload resume --hash <prefix>` — re-check an ambiguous payload
   (timeout/interrupt); never re-sends
 
-Honest scope: only `Payment`, `TrustSet`, and `ClaimReward` builders are
-implemented in P1 — the policy allowlist matches. `Remit`, `Import`
-(Burn2Mint), `URIToken*`, and `SetHook` are planned for P2 and are
-refused by default policy until then.
+Honest scope: `Payment`, `TrustSet`, `ClaimReward`, `Remit`, and
+`URITokenMint` / `URITokenBuy` / `URITokenBurn` builders are implemented —
+the policy allowlist matches. `Import` (Burn2Mint) and `SetHook` are
+planned and refused by default policy until then.
 
 ### xMerch storefronts (`bin/xmerch`)
 
@@ -181,6 +185,29 @@ generic 3×-median fee applies — Remit carries the standard minimum
 transaction cost on Xahau. `MintURIToken` / `URITokenIDs` attachments
 are validated by the shape schema but not built by this command yet —
 they arrive with the URIToken builders.
+
+### URITokens — mint, buy, burn
+
+```bash
+xahau uritoken-mint --uri "ipfs://…" [--digest <64hex>] [--burnable] \
+    [--price "25 XAH"] [--destination r…]
+xahau uritoken-buy --token-id <64hex> --amount "25 XAH"
+xahau uritoken-burn --token-id <64hex>
+```
+
+`uritoken-mint` takes URI text (UTF-8 → hex) or pre-encoded `--uri-hex`
+(256-byte ledger cap enforced client-side), optional content `--digest`,
+`--burnable` (`tfBurnable` — lets the issuer destroy the token later),
+and optional `--price` / `--destination` to list the token for sale at
+mint (optionally restricted to one buyer). **Minting locks 0.2 XAH
+reserve per token** (released on burn) — the ceremony warns about this;
+it is a reserve lock, not spend, so it is not counted against spend
+limits. `uritoken-buy` reads the token's ledger entry first and refuses
+unless the token is listed for sale at **exactly** the `--amount` given
+(no underpaying a moved listing, no wrong currency) and the buyer isn't
+blocked by a restricted-buyer `Destination`. `uritoken-burn` refuses
+unless you are the token's owner or issuer (issuer burns need
+`tfBurnable` from mint, or the ledger rejects with `tecNO_PERMISSION`).
 
 ## Setup
 
