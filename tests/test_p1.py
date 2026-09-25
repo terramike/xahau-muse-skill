@@ -411,6 +411,30 @@ with tempfile.TemporaryDirectory() as td:
     check("hook diagnostics degrades gracefully when the node fails",
           any("failed" in ln for ln in _lines2))
 
+X = load(BIN / "xahau", "xahau_cli")
+
+
+def _refused(fn):
+    try:
+        fn()
+    except SystemExit:
+        return True
+    return False
+
+
+# ---- ClaimReward builder: Issuer is required by the ledger ----
+GEN = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"
+claim_tx = X.build_claim(ACCT)
+check("claim defaults Issuer to the genesis account",
+      claim_tx.get("Issuer") == GEN)
+check("claim keeps Account/TransactionType",
+      claim_tx["Account"] == ACCT
+      and claim_tx["TransactionType"] == "ClaimReward")
+check("claim with explicit issuer keeps it",
+      X.build_claim(ACCT, ISS)["Issuer"] == ISS)
+check("claim refuses issuer == account (temMALFORMED)",
+      _refused(lambda: X.build_claim(ACCT, ACCT)))
+
 fails = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(fails)}/{len(PASS)} passed")
 sys.exit(1 if fails else 0)

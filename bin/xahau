@@ -265,10 +265,18 @@ def build_trustline(account, ccy, issuer, limit: Decimal):
                             "value": format(limit, "f")}}
 
 
+# Xahau genesis account — the required Issuer for ClaimReward opt-in/claim
+# (the ledger rejects a claim with no Issuer as temMALFORMED).
+GENESIS_ACCOUNT = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"
+
+
 def build_claim(account, issuer=None):
-    tx = {"Account": account, "TransactionType": "ClaimReward"}
-    if issuer:
-        tx["Issuer"] = issuer
+    issuer = issuer or GENESIS_ACCOUNT
+    if issuer == account:
+        sys.exit("ClaimReward issuer cannot be the claiming account "
+                 "(temMALFORMED) — refusing")
+    tx = {"Account": account, "TransactionType": "ClaimReward",
+          "Issuer": issuer}
     return tx
 
 
@@ -727,7 +735,10 @@ def main():
     s = sub.add_parser("trustline")
     s.add_argument("--ccy", required=True); s.add_argument("--issuer", required=True)
     s.add_argument("--limit", required=True); s.add_argument("--address")
-    s = sub.add_parser("claim"); s.add_argument("--issuer"); s.add_argument("--address")
+    s = sub.add_parser("claim")
+    s.add_argument("--issuer",
+                   help="reward issuer (default: the Xahau genesis account)")
+    s.add_argument("--address")
     s = sub.add_parser("uritoken-mint")
     s.add_argument("--uri", help="URI text (UTF-8 encoded to hex)")
     s.add_argument("--uri-hex", help="URI already hex-encoded")
