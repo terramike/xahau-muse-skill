@@ -63,6 +63,55 @@ def build_payment(account, to, amount: Decimal, ccy, issuer, dest_tag):
     return tx
 
 
+def parse_amount_spec(spec: str):
+    """Parse one --amount spec: '1 XAH' or '10 USD.rISSUER...'.
+
+    Returns (ccy, issuer, Decimal). Fails closed on bad input.
+    """
+    parts = spec.split()
+    if len(parts) != 2:
+        sys.exit(f"Bad --amount {spec!r}: use \"VALUE CCY\" or \"VALUE CCY.ISSUER\"")
+    value_s, token = parts
+    value = C.dec(value_s, "amount value")
+    if "." in token:
+        ccy, issuer = token.split(".", 1)
+        if not issuer or not C.is_valid_classic_address(issuer):
+            sys.exit(f"Bad --amount {spec!r}: invalid issuer")
+    else:
+        ccy, issuer = token, None
+    ccy = ccy.upper()
+    if ccy == C.NATIVE and issuer:
+        sys.exit(f"Bad --amount {spec!r}: XAH takes no issuer")
+    if ccy != C.NATIVE and not issuer:
+        sys.exit(f"Bad --amount {spec!r}: issuer required for {ccy}")
+    return ccy, issuer, value
+
+
+def build_remit(account, to, specs, dest_tag):
+    """Atomic multi-asset Remit. specs: list of 'VALUE CCY[.ISSUER]' strings."""
+    if to == account:
+        sys.exit("Remit to self is redundant (temREDUNDANT) — refusing")
+    amounts = []
+    seen = set()
+    for spec in specs:
+        ccy, issuer, value = parse_amount_spec(spec)
+        key = (C.currency_code(ccy), issuer)
+        if key in seen:
+            sys.exit(f"duplicate currency in one Remit: {ccy}"
+                     + (f".{issuer}" if issuer else "")
+                     + " — the ledger allows one entry per currency (temMALFORMED)")
+        seen.add(key)
+        amounts.append({"AmountEntry":
+                        {"Amount": make_amount(ccy, issuer, value)}})
+    if len(amounts) > 32:
+        sys.exit("Remit holds at most 32 Amounts entries")
+    tx = {"Account": account, "TransactionType": "Remit",
+          "Destination": to, "Amounts": amounts}
+    if dest_tag is not None:
+        tx["DestinationTag"] = int(dest_tag)
+    return tx
+
+
 def build_trustline(account, ccy, issuer, limit: Decimal):
     if ccy.upper() == C.NATIVE:
         sys.exit("cannot trustline the native asset")
@@ -118,6 +167,12 @@ def autofill(tx, network):
         except (KeyError, ValueError, RuntimeError, TypeError) as exc:
             sys.exit(f"Hook-aware fee estimate unavailable: {exc}")
     else:
+        # Xahau-only types (Remit, ClaimReward, ...) cannot be serialized by
+        # xrpl-py's binary codec, so the tx-specific fee probe cannot run for
+        # them — the generic 3x-median fee stands. Remit carries the standard
+        # minimum transaction cost on Xahau (verified against the protocol
+        # docs); reserve requirements for activation/trustline side-effects
+        # are separate ledger reserves, not fee.
         tx["Fee"] = str(generic_fee)
     # Binary-codec sanity where the codec knows the type (classic types).
     # Xahau-only types bind via canonical JSON instead (see xahau_common).
@@ -349,6 +404,31 @@ def cmd_send(args):
              *extra])
 
 
+def cmd_remit(args):
+    acct = need_account(args)
+    if not C.is_valid_classic_address(args.to):
+        sys.exit(f"not a valid destination: {args.to!r}")
+    hooks = C.destination_hook_count(CFG["network"], args.to)
+    if hooks and not args.allow_hooks:
+        sys.exit(
+            f"destination {args.to} has {hooks} Hook(s) installed. A Hook can "
+            "reject or redirect your remit (e.g. an NFT-vending hook that "
+            "only accepts exact amounts). Re-run with --allow-hooks if you "
+            "understand what that Hook does.")
+    tx = build_remit(acct, args.to, args.amount, args.destination_tag)
+    extra = []
+    if hooks:
+        extra.append(f"WARNING:  destination has {hooks} Hook(s) installed "
+                     "(--allow-hooks given)")
+    lines = []
+    for entry in tx["Amounts"]:
+        lines.append(f"amount:   {C.fmt_amount(entry['AmountEntry']['Amount'])}")
+    lines += [f"to:       {C.short_addr(args.to)}",
+              f"dest tag: {args.destination_tag or 'NONE'}",
+              *extra]
+    propose(tx, "remit", lines)
+
+
 def cmd_trustline(args):
     acct = need_account(args)
     if not C.is_valid_classic_address(args.issuer):
@@ -414,6 +494,14 @@ def main():
     s.add_argument("--destination-tag", type=int); s.add_argument("--address")
     s.add_argument("--allow-hooks", action="store_true",
                    help="proceed even if the destination has Hooks installed")
+    s = sub.add_parser("remit")
+    s.add_argument("--to", required=True)
+    s.add_argument("--amount", required=True, action="append",
+                   help="repeatable: \"VALUE CCY\" or \"VALUE CCY.ISSUER\" "
+                        "(e.g. --amount \"1 XAH\" --amount \"10 USD.rABC...\")")
+    s.add_argument("--destination-tag", type=int); s.add_argument("--address")
+    s.add_argument("--allow-hooks", action="store_true",
+                   help="proceed even if the destination has Hooks installed")
     s = sub.add_parser("trustline")
     s.add_argument("--ccy", required=True); s.add_argument("--issuer", required=True)
     s.add_argument("--limit", required=True); s.add_argument("--address")
@@ -425,7 +513,7 @@ def main():
     {"setup": cmd_setup, "init-policy": cmd_init_policy,
      "balance": cmd_balance, "quote": cmd_quote, "offers": cmd_offers,
      "hook": cmd_hook, "network": cmd_network, "reconcile": cmd_reconcile,
-     "send": cmd_send, "trustline": cmd_trustline,
+     "send": cmd_send, "trustline": cmd_trustline, "remit": cmd_remit,
      "claim": cmd_claim}[args.cmd](args)
 
 

@@ -191,6 +191,8 @@ network. Live read-only verification: `xahau hook` decoded the 36 XAH
 AMOUNT requirement; fee probe paid 0.015 XAH correctly for both hook'd
 and plain destinations on testnet.
 
-**Still P2 (awaiting authorization):** Remit, Import/Burn2Mint,
+**P2 (Remit done 2026-09-24 — builder, shape schema, multi-asset spend
+accounting, hook gate, 41/41 tests, live testnet proposal verified):**
+Import/Burn2Mint,
 URIToken mint/buy/burn, SetHook (default-deny recommended), deeper
 xMerch. Not published to GitHub.

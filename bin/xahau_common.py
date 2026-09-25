@@ -381,9 +381,16 @@ def describe_tx(tx: dict, action_hint: str = "?") -> list:
         lines += [f"token id: {tx.get('URITokenID', '')[:16]}…"]
     elif ttype == "Remit":
         lines += [f"to:       {short_addr(tx['Destination'])}"]
+        for entry in tx.get("Amounts", []) or []:
+            amt = (entry.get("AmountEntry", {}) or {}).get("Amount")
+            lines += [f"amount:   {fmt_amount(amt) if amt else '(malformed entry)'}"]
+        tag = tx.get("DestinationTag")
+        lines += [f"dest tag: {tag if tag is not None else 'NONE'}"]
         n = len(tx.get("URITokenIDs", []) or [])
         if n:
             lines += [f"uritokens: {n} attached"]
+        if tx.get("MintURIToken"):
+            lines += ["mint:     URIToken mint attached"]
     elif ttype == "Import":
         lines += [f"issuer:   {short_addr(tx.get('Issuer', ''))}"]
     elif ttype == "SetHook":
@@ -415,7 +422,7 @@ REQUIRED_FIELDS = {
     "URITokenBuy": {"URITokenID", "Amount"},
     "URITokenBurn": {"URITokenID"},
     "SetHook": {"CreateCode"},
-    "Remit": {"Destination"},
+    "Remit": {"Destination", "Amounts"},
     "ClaimReward": set(),
     "Import": {"Issuer"},
 }
@@ -434,8 +441,9 @@ ALLOWED_FIELDS = {
     "SetHook": COMMON_FIELDS | {"CreateCode", "Flags", "HookOn",
                                 "HookNamespace", "HookApiVersion",
                                 "HookParameters", "HookGrants"},
-    "Remit": COMMON_FIELDS | {"Destination", "DestinationTag", "Inform",
-                              "MintURIToken", "URITokenIDs"},
+    "Remit": COMMON_FIELDS | {"Destination", "DestinationTag", "Amounts",
+                              "Inform", "MintURIToken", "URITokenIDs",
+                              "InvoiceID", "Blob"},
     "ClaimReward": COMMON_FIELDS | {"Issuer"},
     "Import": COMMON_FIELDS | {"Issuer", "Blob"},
 }
@@ -444,7 +452,7 @@ ALLOWED_FIELDS = {
 # BalanceRewards); disabled — AMM, Escrow, PayChan, MultiSign, XLS-20,
 # TickSize. The skill's allowlist MUST NOT include the disabled types.
 # Enable only types with implemented builders and complete spend accounting.
-DEFAULT_ALLOWED_TX_TYPES = ["Payment", "TrustSet", "ClaimReward"]
+DEFAULT_ALLOWED_TX_TYPES = ["Payment", "TrustSet", "ClaimReward", "Remit"]
 
 
 def validate_tx_shape(tx: dict, allowed_types) -> list:
@@ -461,6 +469,53 @@ def validate_tx_shape(tx: dict, allowed_types) -> list:
     for k in REQUIRED_FIELDS.get(ttype, ()):
         if k not in tx:
             problems.append(f"field {k!r} is required for {ttype}")
+    if ttype == "Remit":
+        problems += validate_remit_entries(tx)
+    return problems
+
+
+def validate_remit_entries(tx: dict) -> list:
+    """Consensus-shape checks for Remit Amounts (fail fast, client-side).
+
+    The ledger rejects with temMALFORMED when: more than 32 AmountEntry
+    entries, the native currency appears more than once, or an issued
+    currency appears more than once. Each entry must be exactly
+    {'AmountEntry': {'Amount': <CurrencyAmount>}}.
+    """
+    problems = []
+    amounts = tx.get("Amounts")
+    if not isinstance(amounts, list):
+        return ["Remit Amounts must be an array of AmountEntry objects"]
+    if not 1 <= len(amounts) <= 32:
+        problems.append(
+            f"Remit needs 1-32 Amounts entries, got {len(amounts)}")
+    seen = set()
+    for i, entry in enumerate(amounts):
+        label = f"Remit Amounts[{i}]"
+        if not isinstance(entry, dict) or set(entry) != {"AmountEntry"}:
+            problems.append(
+                f"{label} must be exactly {{'AmountEntry': {{'Amount': ...}}}}")
+            continue
+        inner = entry["AmountEntry"]
+        if not isinstance(inner, dict) or set(inner) != {"Amount"}:
+            problems.append(
+                f"{label}.AmountEntry must hold exactly one 'Amount'")
+            continue
+        amt = inner["Amount"]
+        if isinstance(amt, str):
+            key = ("XAH", None)
+        elif (isinstance(amt, dict)
+              and {"currency", "issuer", "value"} <= set(amt)):
+            key = (amt["currency"], amt["issuer"])
+        else:
+            problems.append(f"{label}.Amount is not a valid amount")
+            continue
+        if key in seen:
+            problems.append(
+                f"{label}: duplicate currency {key[0]}"
+                + (f".{key[1]}" if key[1] else "")
+                + " — one entry per currency per Remit")
+        seen.add(key)
     return problems
 
 
@@ -489,6 +544,13 @@ def validate_amounts(tx: dict) -> list:
         p = num(tx.get("Amount"), "Amount")
         if p:
             problems.append(p)
+    elif ttype == "Remit":
+        for i, entry in enumerate(tx.get("Amounts", []) or []):
+            inner = entry.get("AmountEntry") if isinstance(entry, dict) else None
+            amt = inner.get("Amount") if isinstance(inner, dict) else None
+            p = num(amt, f"Amounts[{i}]")
+            if p:
+                problems.append(p)
     elif ttype == "TrustSet":
         la = tx.get("LimitAmount", {})
         try:
@@ -527,6 +589,11 @@ def tx_tokens(tx):
         add_amount(tx.get("LimitAmount"))
     elif ttype in ("Payment", "URITokenBuy"):
         add_amount(tx.get("Amount"))
+    elif ttype == "Remit":
+        for entry in tx.get("Amounts", []) or []:
+            inner = entry.get("AmountEntry") if isinstance(entry, dict) else None
+            if isinstance(inner, dict):
+                add_amount(inner.get("Amount"))
     toks.discard((NATIVE, None))
     return toks
 
@@ -549,8 +616,13 @@ def tx_spends(tx):
     elif ttype in ("Payment", "URITokenBuy"):
         amt = tx.get("Amount")
         add(asset_key(amt), amount_value(amt))
+    elif ttype == "Remit":
+        # Atomic multi-asset: every Amounts entry is spent.
+        for entry in tx.get("Amounts", []) or []:
+            amt = entry["AmountEntry"]["Amount"]
+            add(asset_key(amt), amount_value(amt))
     # TrustSet / OfferCancel / URITokenMint / URITokenBurn / SetHook /
-    # Remit / ClaimReward / Import spend nothing beyond the fee
+    # ClaimReward / Import spend nothing beyond the fee
     add(NATIVE, drops_to_xah(tx.get("Fee", "0")))
     return spends
 

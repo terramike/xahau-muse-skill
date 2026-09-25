@@ -161,6 +161,27 @@ when the destination's Hook rejects the payment) — the fee is consumed
 in that case. Approve Xaman payloads promptly: proposals expire
 ~1 minute after creation (`LastLedgerSequence`).
 
+### Remit — atomic multi-asset payments
+
+```bash
+xahau remit --to r… --amount "1 XAH" --amount "10 USD.rISSUER…" \
+    [--destination-tag N] [--allow-hooks]
+```
+
+Sends several currencies to one destination in a single all-or-nothing
+transaction (XLS-55). Each `--amount` is `"VALUE CCY"` or
+`"VALUE CCY.ISSUER"`, repeatable up to 32 entries, one entry per
+currency (the ledger rejects duplicates with `temMALFORMED`, so the
+builder refuses them first). The same `--allow-hooks` gate as `send`
+applies: Hook-guarded destinations are refused without the flag.
+Spend accounting sums every entry, so per-asset and rolling-24h limits
+cover the whole remit. Fee: the tx-specific Hook-aware probe cannot run
+for Remit (xrpl-py's binary codec doesn't know Xahau-only types), so the
+generic 3×-median fee applies — Remit carries the standard minimum
+transaction cost on Xahau. `MintURIToken` / `URITokenIDs` attachments
+are validated by the shape schema but not built by this command yet —
+they arrive with the URIToken builders.
+
 ## Setup
 
 ```bash
